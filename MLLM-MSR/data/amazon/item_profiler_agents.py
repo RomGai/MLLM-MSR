@@ -23,13 +23,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional
 
-try:
-    import torch
-    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-except Exception:  # pragma: no cover - allow lightweight environments
-    torch = None
-    AutoProcessor = None
-    Qwen3VLForConditionalGeneration = None
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+# try:
+#     import torch
+#     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+#except Exception:  # pragma: no cover - allow lightweight environments
+#     torch = None
+#     AutoProcessor = None
+#     Qwen3VLForConditionalGeneration = None
 
 
 BehaviorLabel = Literal["positive", "negative"]
