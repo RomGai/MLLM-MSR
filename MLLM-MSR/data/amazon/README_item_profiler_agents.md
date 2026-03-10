@@ -87,7 +87,7 @@ history_profiler.profile_and_store(hist_item)
 3. 将两类 profile 写入本地 SQLite，并在终端打印每条 profile 的 JSON 结果。
 
 - 标签解析时会同时读取 `pos` 和 `neg`；并打印统计信息（总量、成功关联到时间戳的条数、因缺失时间戳被丢弃条数）。
-- 历史序列严格按 `*_u_i_pairs.tsv` 的原始时间戳升序排序（时间戳小/更早在前），不会人为构造时间戳。
+- 历史序列中：positive 严格按 `*_u_i_pairs.tsv` 的原始时间戳升序排序（时间戳小/更早在前）；negative 不要求时间戳，缺失时间戳也会保留并参与建模。
 
 ## Qwen3-VL 官方式推理参数
 

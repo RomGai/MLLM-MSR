@@ -591,9 +591,10 @@ def _pick_multi_user_labeled_sequences(
     num_users: int = 2,
     max_rows: int = 500,
 ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Pick multiple users from pos/neg labels and return labeled sequences sorted by timestamp.
+    """Pick multiple users from pos/neg labels and return labeled sequences.
 
-    Labels come from `*_user_items_negs.tsv`; timestamps are joined from `*_u_i_pairs.tsv`.
+    - Positive labels use timestamps joined from `*_u_i_pairs.tsv`.
+    - Negative labels are kept even when no timestamp exists (timestamp will be None).
     """
     ts_map = _build_user_item_timestamp_map(user_pairs_tsv_path)
     stats = {
@@ -602,6 +603,7 @@ def _pick_multi_user_labeled_sequences(
         "pos_rows_with_timestamp": 0,
         "neg_rows_with_timestamp": 0,
         "rows_dropped_missing_timestamp": 0,
+        "neg_rows_without_timestamp_kept": 0,
     }
 
     grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -615,13 +617,17 @@ def _pick_multi_user_labeled_sequences(
             stats["neg_rows_in_negs"] += 1
 
         ts = ts_map.get((user_id, item_id))
-        if ts is None:
-            stats["rows_dropped_missing_timestamp"] += 1
-            continue
         if behavior == "positive":
+            if ts is None:
+                # Positive interactions should have real timestamps from interactions file.
+                stats["rows_dropped_missing_timestamp"] += 1
+                continue
             stats["pos_rows_with_timestamp"] += 1
         elif behavior == "negative":
-            stats["neg_rows_with_timestamp"] += 1
+            if ts is None:
+                stats["neg_rows_without_timestamp_kept"] += 1
+            else:
+                stats["neg_rows_with_timestamp"] += 1
 
         grouped.setdefault(user_id, []).append(
             {
@@ -641,8 +647,16 @@ def _pick_multi_user_labeled_sequences(
     merged: List[Dict[str, Any]] = []
     for uid in selected_users:
         seq = grouped[uid]
-        # Strict chronological order: smaller/earlier timestamp first.
-        seq.sort(key=lambda r: int(r["timestamp"]))
+        # Order rule:
+        # 1) positives first in strict chronological order (smaller/earlier timestamp first)
+        # 2) negatives after positives (timestamp not required)
+        seq.sort(
+            key=lambda r: (
+                0 if r["behavior"] == "positive" else 1,
+                int(r["timestamp"]) if r["timestamp"] is not None else 10**30,
+                str(r["item_id"]),
+            )
+        )
         merged.extend(seq[:max_rows])
 
     # Keep per-user timestamp order and selected user order.
