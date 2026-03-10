@@ -28,6 +28,8 @@
 - `user_id`
 - 用户实时 `query`
 
+> 若 `query` 为空，Agent 3 会自动切换到“基于用户历史自主意图推断”模式。
+
 ### 职责 1：意图与层级映射
 1. 从全局商品库扫描得到：
    - 全部 `category_path` 清单
@@ -37,6 +39,12 @@
    - `item_types`（数组）
    - `reasoning`
 3. 若都不匹配，允许模型返回新造类目路径。
+
+### 无 Query 时的兜底策略（历史自驱动）
+当 `query` 为空时，不调用 LLM 路由，改为：
+1. 读取该用户最近 `lookback` 条历史（默认 200）。
+2. 优先使用 `positive` 行为记录；若没有，再回退到全部近期记录。
+3. 按 `taxonomy.category_path` 与 `taxonomy.item_type` 做频次统计，取 top 类目/类型作为本次路由目标。
 
 ### 职责 2：动态上卷双路召回
 
@@ -65,6 +73,8 @@
 - `candidate_items`: 路 A 召回商品集合
 - `query_relevant_history`: 路 B 历史相关记录
 - `routing`: 本次路由说明（选中类目、item_type、最终上卷层级）
+
+其中 `routing.reasoning` 会明确说明本次是 `LLM 路由` 还是 `query 为空时的历史推断`。
 
 可直接作为下一阶段排序/重排输入。
 

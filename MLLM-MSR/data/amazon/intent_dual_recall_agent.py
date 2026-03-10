@@ -304,6 +304,74 @@ class GlobalHistoryAccessor:
                 break
         return results
 
+    def infer_user_intent_from_history(
+        self,
+        user_id: str,
+        lookback: int = 200,
+        min_positive_first: bool = True,
+    ) -> RoutingResult:
+        """Infer category intent from user history when query is empty.
+
+        Strategy:
+        1) Prefer recent positive interactions (if available)
+        2) Fallback to all recent interactions
+        3) Aggregate frequent taxonomy.category_path / taxonomy.item_type
+        """
+        rows = self.history_conn.execute(
+            """
+            SELECT behavior, timestamp, profile_json
+            FROM user_history_profiles
+            WHERE user_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (str(user_id), int(lookback)),
+        ).fetchall()
+
+        if not rows:
+            return RoutingResult(
+                query="",
+                category_paths=[],
+                item_types=[],
+                reasoning="No query and no history found; cannot infer user intent.",
+            )
+
+        scoped_rows = rows
+        if min_positive_first:
+            positives = [r for r in rows if str(r["behavior"]).lower() == "positive"]
+            if positives:
+                scoped_rows = positives
+
+        cat_cnt: Dict[str, int] = {}
+        type_cnt: Dict[str, int] = {}
+        for r in scoped_rows:
+            try:
+                profile = json.loads(r["profile_json"])
+            except json.JSONDecodeError:
+                continue
+            path, item_type = self._extract_taxonomy(profile)
+            if path:
+                key = " > ".join(path)
+                cat_cnt[key] = cat_cnt.get(key, 0) + 1
+            if item_type:
+                type_cnt[item_type] = type_cnt.get(item_type, 0) + 1
+
+        top_cats = sorted(cat_cnt.items(), key=lambda x: (-x[1], x[0]))[:3]
+        top_types = sorted(type_cnt.items(), key=lambda x: (-x[1], x[0]))[:5]
+        paths = [[seg.strip() for seg in cat.split(">") if seg.strip()] for cat, _ in top_cats]
+        item_types = [t for t, _ in top_types]
+
+        reason_scope = "positive-only" if scoped_rows is not rows else "all-recent"
+        return RoutingResult(
+            query="",
+            category_paths=paths,
+            item_types=item_types,
+            reasoning=(
+                "Query is empty; inferred intent from "
+                f"user history ({reason_scope}, samples={len(scoped_rows)})."
+            ),
+        )
+
 
 class RoutingRecallAgent:
     """Agent 3: routing + dual recall."""
@@ -320,8 +388,12 @@ class RoutingRecallAgent:
         max_candidate_items: int = 200,
         max_history_rows: int = 200,
     ) -> IntentDualRecallOutput:
+        clean_query = (query or "").strip()
         category_catalog, item_type_catalog = self.accessor.category_catalog()
-        routing = self.llm.route(query, category_catalog, item_type_catalog)
+        if clean_query:
+            routing = self.llm.route(clean_query, category_catalog, item_type_catalog)
+        else:
+            routing = self.accessor.infer_user_intent_from_history(user_id=user_id)
 
         if not routing.category_paths and routing.item_types:
             routing.category_paths = [[routing.item_types[0]]]
@@ -340,7 +412,7 @@ class RoutingRecallAgent:
         )
 
         return IntentDualRecallOutput(
-            query=query,
+            query=clean_query,
             user_id=str(user_id),
             routing={
                 "reasoning": routing.reasoning,
