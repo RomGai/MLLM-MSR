@@ -122,7 +122,7 @@ class Qwen3VLExtractor:
             "top_k": self.top_k,
             "temperature": 0.0 if force_greedy else self.temperature,
             "repetition_penalty": self.repetition_penalty,
-#             "presence_penalty": self.presence_penalty,
+            "presence_penalty": self.presence_penalty,
         }
         if force_greedy:
             generate_kwargs.pop("top_p", None)
@@ -273,6 +273,16 @@ class GlobalItemDB:
             ),
         )
         self.conn.commit()
+
+    def get_profile(self, item_id: str) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            "SELECT profile_json FROM global_item_features WHERE item_id = ?",
+            (str(item_id),),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
 
 
 class UserHistoryLogDB:
@@ -527,6 +537,33 @@ def _sample_distinct_user_item_rows(
     return picked
 
 
+def _pick_single_user_full_sequence(
+    rows: Iterable[Dict[str, str]],
+    seed: int = 2025,
+) -> List[Dict[str, str]]:
+    """Pick one user and return their full interaction sequence sorted by timestamp."""
+    grouped: Dict[str, List[Dict[str, str]]] = {}
+    for row in rows:
+        uid = str(row.get("user_id", ""))
+        if not uid:
+            continue
+        grouped.setdefault(uid, []).append(row)
+
+    if not grouped:
+        return []
+
+    # Prefer users with longer sequences; break tie randomly but reproducibly.
+    users = list(grouped.keys())
+    rng = random.Random(seed)
+    rng.shuffle(users)
+    users.sort(key=lambda u: len(grouped[u]), reverse=True)
+    picked_user = users[0]
+
+    seq = grouped[picked_user]
+    seq.sort(key=lambda r: int(r.get("timestamp", 0)))
+    return seq
+
+
 def _write_jsonl(path: str | Path, records: List[Dict[str, Any]]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -549,10 +586,10 @@ def _export_sqlite_table_as_jsonl(db_path: str | Path, table: str, out_path: str
 if __name__ == "__main__":
     # Real runnable example:
     # - randomly sample 10 candidate items from item DB
-    # - randomly sample 10 user-history interactions from user DB
+    # - pick one user and run full history sequence modeling by timestamp order
     # - run both profilers and print profile outputs
     random_seed = 2025
-    sample_k = 4
+    sample_k = 10
     item_desc_tsv_path = "./processed/Video_Games_item_desc.tsv"
     user_pairs_tsv_path = "./processed/Video_Games_u_i_pairs.tsv"
     run_tag = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -595,15 +632,18 @@ if __name__ == "__main__":
         print(f"\n[Agent 1][{idx}/{len(sampled_item_ids)}] item_id={item_id}")
         print(json.dumps(profile, ensure_ascii=False, indent=2))
 
-    sampled_user_rows = _sample_distinct_user_item_rows(
+    sampled_user_rows = _pick_single_user_full_sequence(
         load_user_interactions(user_pairs_tsv_path),
-        k=sample_k,
         seed=random_seed,
     )
     history_meta_records: List[Dict[str, Any]] = []
     history_profile_records: List[Dict[str, Any]] = []
 
-    print(f"\n[Agent 2] Running history profiling on {len(sampled_user_rows)} sampled user-item rows...")
+    chosen_user_id = sampled_user_rows[0]["user_id"] if sampled_user_rows else ""
+    print(
+        "\n[Agent 2] Running full-sequence history profiling "
+        f"for user_id={chosen_user_id} with {len(sampled_user_rows)} interactions..."
+    )
     for idx, row in enumerate(sampled_user_rows, start=1):
         user_id = str(row["user_id"])
         item_id = str(row["item_id"])
@@ -621,13 +661,40 @@ if __name__ == "__main__":
             timestamp=timestamp,
         )
         history_meta_records.append(asdict(hist_item))
-        profile = history_profiler.profile_and_store(hist_item)
+
+        # Reuse existing item profile if already modeled in global item DB.
+        profile = candidate_profiler.global_db.get_profile(item_id)
+        profile_source = "global_db_reused"
+        if profile is None:
+            profile = candidate_profiler.profile_and_store(
+                ItemProfileInput(
+                    item_id=item_id,
+                    title=hist_item.title,
+                    detail_text=hist_item.detail_text,
+                    main_image=hist_item.main_image,
+                    detail_images=hist_item.detail_images,
+                    category_hint=hist_item.category_hint,
+                )
+            )
+            profile_source = "newly_profiled"
+
+        profile["behavior"] = hist_item.behavior
+        profile["timestamp"] = int(hist_item.timestamp)
+        profile["user_id"] = hist_item.user_id
+        history_profiler.history_db.insert(
+            user_id=hist_item.user_id,
+            item_id=hist_item.item_id,
+            behavior=hist_item.behavior,
+            timestamp=hist_item.timestamp,
+            profile=profile,
+        )
         history_profile_records.append(
             {
                 "user_id": user_id,
                 "item_id": item_id,
                 "timestamp": timestamp,
                 "source": "history",
+                "profile_source": profile_source,
                 "profile": profile,
             }
         )

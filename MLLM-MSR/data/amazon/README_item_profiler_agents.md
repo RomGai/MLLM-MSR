@@ -83,7 +83,7 @@ history_profiler.profile_and_store(hist_item)
 直接执行 `python item_profiler_agents.py` 时，会：
 
 1. 从 `*_item_desc.tsv` 随机抽取最多 10 个不同商品 `item_id` 跑 Agent 1；
-2. 从 `*_u_i_pairs.tsv` 随机抽取最多 10 条不同 `user_id` 且不同 `item_id` 的交互跑 Agent 2；
+2. 从 `*_u_i_pairs.tsv` 选择 1 个用户，并按时间戳升序对该用户完整交互序列进行 Agent 2 建模；
 3. 将两类 profile 写入本地 SQLite，并在终端打印每条 profile 的 JSON 结果。
 
 ## Qwen3-VL 官方式推理参数
@@ -116,3 +116,5 @@ history_profiler.profile_and_store(hist_item)
 - `history_profiles.jsonl`：Agent2 生成的 profile
 - `global_item_features_snapshot.jsonl`：全局商品库快照
 - `user_history_profiles_snapshot.jsonl`：用户历史库快照
+
+- 若某个 history item 在全局商品库中已经建模（`global_item_features` 已存在该 `item_id`），会直接复用已建模 profile，不重复调用模型。
