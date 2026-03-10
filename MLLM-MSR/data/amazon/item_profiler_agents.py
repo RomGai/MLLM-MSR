@@ -51,7 +51,17 @@ class ItemProfileInput:
 class HistoryItemProfileInput(ItemProfileInput):
     user_id: str = ""
     behavior: BehaviorLabel = "positive"
-    timestamp: int = 0
+    timestamp: Optional[int] = 0
+
+
+def _normalize_timestamp_for_db(ts: Optional[int]) -> int:
+    """Normalize optional timestamp to DB-safe integer.
+
+    Negative samples may have no real interaction timestamp. We store such cases as -1.
+    """
+    if ts is None:
+        return -1
+    return int(ts)
 
 
 class Qwen3VLExtractor:
@@ -122,7 +132,7 @@ class Qwen3VLExtractor:
             "top_k": self.top_k,
             "temperature": 0.0 if force_greedy else self.temperature,
             "repetition_penalty": self.repetition_penalty,
-#            "presence_penalty": self.presence_penalty,
+            "presence_penalty": self.presence_penalty,
         }
         if force_greedy:
             generate_kwargs.pop("top_p", None)
@@ -319,9 +329,10 @@ class UserHistoryLogDB:
         user_id: str,
         item_id: str,
         behavior: BehaviorLabel,
-        timestamp: int,
+        timestamp: Optional[int],
         profile: Dict[str, Any],
     ) -> None:
+        timestamp_db = _normalize_timestamp_for_db(timestamp)
         self.conn.execute(
             """
             INSERT INTO user_history_profiles
@@ -332,21 +343,28 @@ class UserHistoryLogDB:
                 user_id,
                 item_id,
                 behavior,
-                int(timestamp),
+                timestamp_db,
                 json.dumps(profile, ensure_ascii=False),
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
         self.conn.commit()
 
-    def exists(self, user_id: str, item_id: str, behavior: BehaviorLabel, timestamp: int) -> bool:
+    def exists(
+        self,
+        user_id: str,
+        item_id: str,
+        behavior: BehaviorLabel,
+        timestamp: Optional[int],
+    ) -> bool:
+        timestamp_db = _normalize_timestamp_for_db(timestamp)
         cursor = self.conn.execute(
             """
             SELECT 1 FROM user_history_profiles
             WHERE user_id = ? AND item_id = ? AND behavior = ? AND timestamp = ?
             LIMIT 1
             """,
-            (str(user_id), str(item_id), str(behavior), int(timestamp)),
+            (str(user_id), str(item_id), str(behavior), timestamp_db),
         )
         return cursor.fetchone() is not None
 
@@ -764,7 +782,8 @@ if __name__ == "__main__":
     for idx, row in enumerate(sampled_user_rows, start=1):
         user_id = str(row["user_id"])
         item_id = str(row["item_id"])
-        timestamp = int(row["timestamp"])
+        timestamp_raw = row.get("timestamp")
+        timestamp: Optional[int] = None if timestamp_raw is None else int(timestamp_raw)
         meta = item_map.get(item_id, {"image": "", "summary": ""})
         hist_item = HistoryItemProfileInput(
             item_id=item_id,
@@ -796,7 +815,7 @@ if __name__ == "__main__":
             profile_source = "newly_profiled"
 
         profile["behavior"] = hist_item.behavior
-        profile["timestamp"] = int(hist_item.timestamp)
+        profile["timestamp"] = hist_item.timestamp
         profile["user_id"] = hist_item.user_id
         if not history_profiler.history_db.exists(
             user_id=hist_item.user_id,
