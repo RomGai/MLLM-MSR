@@ -14,34 +14,23 @@ The implementation is designed for Qwen3VL-8B style multimodal models.
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
+import os
 import random
 import sqlite3
-import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional
-from urllib.parse import urlparse
 
-try:
-    from PIL import Image
-except Exception:  # pragma: no cover - optional dependency
-    Image = None
-
-try:
-    import requests
-except Exception:  # pragma: no cover - optional dependency
-    requests = None
-
-try:
-    import torch
-    from transformers import AutoModelForVision2Seq, AutoProcessor
-except Exception:  # pragma: no cover - allow lightweight environments
-    torch = None
-    AutoProcessor = None
-    AutoModelForVision2Seq = None
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+# try:
+#     import torch
+#     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+#except Exception:  # pragma: no cover - allow lightweight environments
+#     torch = None
+#     AutoProcessor = None
+#     Qwen3VLForConditionalGeneration = None
 
 
 BehaviorLabel = Literal["positive", "negative"]
@@ -67,24 +56,30 @@ class HistoryItemProfileInput(ItemProfileInput):
 
 
 class Qwen3VLExtractor:
-    """A thin wrapper for Qwen VL extraction with JSON-formatted output."""
+    """Qwen3-VL wrapper following official transformers usage style."""
 
     def __init__(
         self,
         model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
         device: str = "cuda",
-        torch_dtype: str = "bfloat16",
-        max_new_tokens: int = 1024,
+        torch_dtype: str = "auto",
+        max_new_tokens: Optional[int] = None,
     ) -> None:
         self.model_name = model_name
-        self.max_new_tokens = max_new_tokens
+        self.max_new_tokens = max_new_tokens or int(os.getenv("out_seq_length", "16384"))
         self.device = device
         self.torch_dtype = torch_dtype
+        self.do_sample = os.getenv("greedy", "false").lower() != "true"
+        self.top_p = float(os.getenv("top_p", "0.8"))
+        self.top_k = int(os.getenv("top_k", "20"))
+        self.temperature = float(os.getenv("temperature", "0.7"))
+        self.repetition_penalty = float(os.getenv("repetition_penalty", "1.0"))
+        self.presence_penalty = float(os.getenv("presence_penalty", "1.5"))
         self._model = None
         self._processor = None
 
     def load(self) -> None:
-        if AutoProcessor is None or AutoModelForVision2Seq is None or torch is None:
+        if AutoProcessor is None or Qwen3VLForConditionalGeneration is None or torch is None:
             raise ImportError(
                 "transformers/torch are not available. Install required dependencies first."
             )
@@ -92,46 +87,23 @@ class Qwen3VLExtractor:
         if self._model is not None and self._processor is not None:
             return
 
-        dtype = getattr(torch, self.torch_dtype)
         self._processor = AutoProcessor.from_pretrained(self.model_name)
-        self._model = AutoModelForVision2Seq.from_pretrained(
-            self.model_name,
-            torch_dtype=dtype,
-            device_map="auto" if self.device == "cuda" else None,
-        )
+        if self.torch_dtype == "auto":
+            self._model = Qwen3VLForConditionalGeneration.from_pretrained(
+                self.model_name,
+                dtype="auto",
+                device_map="auto" if self.device == "cuda" else None,
+            )
+        else:
+            dtype = getattr(torch, self.torch_dtype)
+            self._model = Qwen3VLForConditionalGeneration.from_pretrained(
+                self.model_name,
+                dtype=dtype,
+                device_map="auto" if self.device == "cuda" else None,
+            )
+
         if self.device != "cuda":
             self._model.to(self.device)
-
-    @staticmethod
-    def _is_url(path_or_url: str) -> bool:
-        parsed = urlparse(path_or_url)
-        return parsed.scheme in {"http", "https"}
-
-    @staticmethod
-    def _cache_remote_image(url: str, cache_dir: Path) -> Path:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        ext = Path(urlparse(url).path).suffix or ".jpg"
-        file_name = hashlib.sha256(url.encode("utf-8")).hexdigest() + ext
-        target = cache_dir / file_name
-        if target.exists():
-            return target
-
-        if requests is not None:
-            response = requests.get(url, timeout=20)
-            response.raise_for_status()
-            target.write_bytes(response.content)
-        else:
-            with urllib.request.urlopen(url, timeout=20) as response:
-                target.write_bytes(response.read())
-        return target
-
-    def _open_image(self, path_or_url: str):
-        if Image is None:
-            raise ImportError("Pillow is not available. Install Pillow first.")
-        if self._is_url(path_or_url):
-            cached = self._cache_remote_image(path_or_url, Path("./processed/image_cache"))
-            return Image.open(cached).convert("RGB")
-        return Image.open(path_or_url).convert("RGB")
 
     def extract(
         self,
@@ -140,26 +112,45 @@ class Qwen3VLExtractor:
     ) -> Dict[str, Any]:
         self.load()
 
-        images = [self._open_image(path) for path in image_paths]
+        image_messages = [{"type": "image", "image": path} for path in image_paths]
         messages = [
             {
                 "role": "user",
                 "content": [
+                    *image_messages,
                     {"type": "text", "text": prompt},
-                    *[{"type": "image", "image": img} for img in images],
                 ],
             }
         ]
-        text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self._processor(text=[text], images=images, padding=True, return_tensors="pt")
 
-        if self.device != "cuda":
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        else:
-            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+        inputs = self._processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(self._model.device)
 
-        output_ids = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens)
-        generated_ids = output_ids[:, inputs["input_ids"].shape[1] :]
+        generate_kwargs = {
+            "max_new_tokens": self.max_new_tokens,
+            "do_sample": self.do_sample,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "temperature": self.temperature,
+            "repetition_penalty": self.repetition_penalty,
+            "presence_penalty": self.presence_penalty,
+        }
+        try:
+            output_ids = self._model.generate(**inputs, **generate_kwargs)
+        except TypeError:
+            # Some transformers versions do not support `presence_penalty` in generate().
+            generate_kwargs.pop("presence_penalty", None)
+            output_ids = self._model.generate(**inputs, **generate_kwargs)
+
+        generated_ids = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, output_ids)
+        ]
         generated_text = self._processor.batch_decode(
             generated_ids,
             skip_special_tokens=True,

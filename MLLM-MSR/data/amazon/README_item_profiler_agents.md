@@ -20,6 +20,8 @@
   2. **本地文件路径**
 - 若传入 URL，`item_profiler_agents.py` 会自动下载并缓存到 `./processed/image_cache/`，后续重复使用同一 URL 会直接命中缓存。
 
+> 最新实现已切换为 Qwen3-VL 官方推荐风格：直接把本地路径或 URL 作为 `messages[].content[].image` 传给 `AutoProcessor.apply_chat_template`。
+
 ## 输出数据库
 
 - 全局商品特征库（Global Item DB）
@@ -84,3 +86,14 @@ history_profiler.profile_and_store(hist_item)
 2. 从 `*_u_i_pairs.tsv` 随机抽取最多 10 条不同 `user_id` 且不同 `item_id` 的交互跑 Agent 2；
 3. 将两类 profile 写入本地 SQLite，并在终端打印每条 profile 的 JSON 结果。
 
+## Qwen3-VL 官方式推理参数
+
+`Qwen3VLExtractor` 读取如下环境变量来控制生成：
+
+- `greedy`（默认 `false`）
+- `top_p`（默认 `0.8`）
+- `top_k`（默认 `20`）
+- `temperature`（默认 `0.7`）
+- `repetition_penalty`（默认 `1.0`）
+- `presence_penalty`（默认 `1.5`）
+- `out_seq_length`（建议映射到 `max_new_tokens`，当前默认 `16384`）
