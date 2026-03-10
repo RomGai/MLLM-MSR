@@ -122,7 +122,7 @@ class Qwen3VLExtractor:
             "top_k": self.top_k,
             "temperature": 0.0 if force_greedy else self.temperature,
             "repetition_penalty": self.repetition_penalty,
-            "presence_penalty": self.presence_penalty,
+#             "presence_penalty": self.presence_penalty,
         }
         if force_greedy:
             generate_kwargs.pop("top_p", None)
@@ -552,7 +552,7 @@ if __name__ == "__main__":
     # - randomly sample 10 user-history interactions from user DB
     # - run both profilers and print profile outputs
     random_seed = 2025
-    sample_k = 10
+    sample_k = 4
     item_desc_tsv_path = "./processed/Video_Games_item_desc.tsv"
     user_pairs_tsv_path = "./processed/Video_Games_u_i_pairs.tsv"
     run_tag = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
