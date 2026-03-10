@@ -122,7 +122,7 @@ class Qwen3VLExtractor:
             "top_k": self.top_k,
             "temperature": 0.0 if force_greedy else self.temperature,
             "repetition_penalty": self.repetition_penalty,
-            # "presence_penalty": self.presence_penalty,
+#            "presence_penalty": self.presence_penalty,
         }
         if force_greedy:
             generate_kwargs.pop("top_p", None)
@@ -590,21 +590,39 @@ def _pick_multi_user_labeled_sequences(
     user_items_negs_path: str | Path,
     num_users: int = 2,
     max_rows: int = 500,
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Pick multiple users from pos/neg labels and return labeled sequences sorted by timestamp.
 
     Labels come from `*_user_items_negs.tsv`; timestamps are joined from `*_u_i_pairs.tsv`.
     """
     ts_map = _build_user_item_timestamp_map(user_pairs_tsv_path)
+    stats = {
+        "pos_rows_in_negs": 0,
+        "neg_rows_in_negs": 0,
+        "pos_rows_with_timestamp": 0,
+        "neg_rows_with_timestamp": 0,
+        "rows_dropped_missing_timestamp": 0,
+    }
 
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for row in expand_pos_neg_rows(user_items_negs_path):
         user_id = str(row["user_id"])
         item_id = str(row["item_id"])
         behavior = str(row["behavior"])
+        if behavior == "positive":
+            stats["pos_rows_in_negs"] += 1
+        elif behavior == "negative":
+            stats["neg_rows_in_negs"] += 1
+
         ts = ts_map.get((user_id, item_id))
         if ts is None:
+            stats["rows_dropped_missing_timestamp"] += 1
             continue
+        if behavior == "positive":
+            stats["pos_rows_with_timestamp"] += 1
+        elif behavior == "negative":
+            stats["neg_rows_with_timestamp"] += 1
+
         grouped.setdefault(user_id, []).append(
             {
                 "user_id": user_id,
@@ -615,7 +633,7 @@ def _pick_multi_user_labeled_sequences(
         )
 
     if not grouped:
-        return []
+        return [], stats
 
     # Keep file encounter order (dict insertion order) and pick first N users.
     users = list(grouped.keys())
@@ -623,11 +641,12 @@ def _pick_multi_user_labeled_sequences(
     merged: List[Dict[str, Any]] = []
     for uid in selected_users:
         seq = grouped[uid]
+        # Strict chronological order: smaller/earlier timestamp first.
         seq.sort(key=lambda r: int(r["timestamp"]))
         merged.extend(seq[:max_rows])
 
     # Keep per-user timestamp order and selected user order.
-    return merged
+    return merged, stats
 
 
 def _write_jsonl(path: str | Path, records: List[Dict[str, Any]]) -> None:
@@ -712,7 +731,7 @@ if __name__ == "__main__":
         if idx % batch_size == 0:
             print(f"[Agent 1] batch progress: {idx}/{len(sampled_item_ids)}")
 
-    sampled_user_rows = _pick_multi_user_labeled_sequences(
+    sampled_user_rows, label_parse_stats = _pick_multi_user_labeled_sequences(
         user_pairs_tsv_path,
         user_items_negs_tsv_path,
         num_users=2,
@@ -722,6 +741,8 @@ if __name__ == "__main__":
     history_profile_records: List[Dict[str, Any]] = []
 
     chosen_user_ids = sorted({str(r["user_id"]) for r in sampled_user_rows})
+    print("\n[Agent 2] Parsed label/timestamp stats:")
+    print(json.dumps(label_parse_stats, ensure_ascii=False, indent=2))
     print(
         "\n[Agent 2] Running full-sequence history profiling "
         f"for user_ids={chosen_user_ids} with {len(sampled_user_rows)} interactions..."
