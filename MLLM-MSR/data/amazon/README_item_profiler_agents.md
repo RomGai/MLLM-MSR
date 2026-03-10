@@ -97,3 +97,22 @@ history_profiler.profile_and_store(hist_item)
 - `repetition_penalty`（默认 `1.0`）
 - `presence_penalty`（默认 `1.5`）
 - `out_seq_length`（建议映射到 `max_new_tokens`，当前默认 `16384`）
+
+## JSON 解析鲁棒性
+
+- 为降低模型输出非严格 JSON 导致的报错，`Qwen3VLExtractor` 采用多阶段解析：
+  1. 直接解析；
+  2. 尝试解析 markdown 代码块中的 JSON；
+  3. 在原始输出中扫描可解码的 JSON 对象起点。
+- 若仍失败，会自动进行严格格式重试（强制只输出单个 JSON 对象、并走更确定性生成）。
+
+## 运行产物落盘（便于人工核验）
+
+每次运行 `__main__` 会在 `./processed/profiler_runs/<timestamp>/` 生成：
+
+- `candidate_meta.jsonl`：Agent1 使用的候选商品 meta 输入
+- `history_meta.jsonl`：Agent2 使用的历史交互 meta 输入
+- `candidate_profiles.jsonl`：Agent1 生成的 profile
+- `history_profiles.jsonl`：Agent2 生成的 profile
+- `global_item_features_snapshot.jsonl`：全局商品库快照
+- `user_history_profiles_snapshot.jsonl`：用户历史库快照

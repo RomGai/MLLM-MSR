@@ -23,14 +23,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional
 
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-# try:
-#     import torch
-#     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-#except Exception:  # pragma: no cover - allow lightweight environments
-#     torch = None
-#     AutoProcessor = None
-#     Qwen3VLForConditionalGeneration = None
+try:
+    import torch
+    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+except Exception:  # pragma: no cover - allow lightweight environments
+    torch = None
+    AutoProcessor = None
+    Qwen3VLForConditionalGeneration = None
 
 
 BehaviorLabel = Literal["positive", "negative"]
@@ -75,6 +74,7 @@ class Qwen3VLExtractor:
         self.temperature = float(os.getenv("temperature", "0.7"))
         self.repetition_penalty = float(os.getenv("repetition_penalty", "1.0"))
         self.presence_penalty = float(os.getenv("presence_penalty", "1.5"))
+        self.json_retry = int(os.getenv("json_retry", "1"))
         self._model = None
         self._processor = None
 
@@ -105,6 +105,86 @@ class Qwen3VLExtractor:
         if self.device != "cuda":
             self._model.to(self.device)
 
+    def _generate_text(self, messages: List[Dict[str, Any]], force_greedy: bool = False) -> str:
+        inputs = self._processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(self._model.device)
+
+        generate_kwargs = {
+            "max_new_tokens": self.max_new_tokens,
+            "do_sample": False if force_greedy else self.do_sample,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "temperature": 0.0 if force_greedy else self.temperature,
+            "repetition_penalty": self.repetition_penalty,
+#             "presence_penalty": self.presence_penalty,
+        }
+        if force_greedy:
+            generate_kwargs.pop("top_p", None)
+            generate_kwargs.pop("top_k", None)
+
+        try:
+            output_ids = self._model.generate(**inputs, **generate_kwargs)
+        except TypeError:
+            # Some transformers versions do not support `presence_penalty` in generate().
+            generate_kwargs.pop("presence_penalty", None)
+            output_ids = self._model.generate(**inputs, **generate_kwargs)
+
+        generated_ids = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, output_ids)
+        ]
+        generated_text = self._processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
+        return generated_text
+
+    @staticmethod
+    def _try_json_decode(text: str) -> Optional[Dict[str, Any]]:
+        decoder = json.JSONDecoder()
+        stripped = text.strip()
+
+        # 1) direct decode
+        try:
+            payload = json.loads(stripped)
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError:
+            pass
+
+        # 2) markdown json code fence
+        if "```" in stripped:
+            parts = stripped.split("```")
+            for part in parts:
+                candidate = part.replace("json", "", 1).strip()
+                if not candidate:
+                    continue
+                try:
+                    payload = json.loads(candidate)
+                    if isinstance(payload, dict):
+                        return payload
+                except json.JSONDecodeError:
+                    continue
+
+        # 3) find first decodable JSON object from any '{' start
+        for i, ch in enumerate(stripped):
+            if ch != "{":
+                continue
+            try:
+                payload, _end = decoder.raw_decode(stripped, i)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+
+        return None
+
     def extract(
         self,
         prompt: str,
@@ -123,47 +203,39 @@ class Qwen3VLExtractor:
             }
         ]
 
-        inputs = self._processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
+        generated_text = self._generate_text(messages)
+        parsed = self._try_json_decode(generated_text)
+        if parsed is not None:
+            return parsed
+
+        # Retry with stricter formatting instruction to reduce JSON parsing failures.
+        for retry_idx in range(self.json_retry):
+            strict_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        *image_messages,
+                        {
+                            "type": "text",
+                            "text": (
+                                prompt
+                                + "\n\nIMPORTANT: Output exactly one valid JSON object only. "
+                                + "Do not include markdown/code fences/comments/trailing text."
+                            ),
+                        },
+                    ],
+                }
+            ]
+            generated_text = self._generate_text(strict_messages, force_greedy=True)
+            parsed = self._try_json_decode(generated_text)
+            if parsed is not None:
+                return parsed
+
+        raise ValueError(
+            "Model output is not valid JSON after retries. "
+            f"Last output (truncated): {generated_text[:2000]}"
         )
-        inputs = inputs.to(self._model.device)
 
-        generate_kwargs = {
-            "max_new_tokens": self.max_new_tokens,
-            "do_sample": self.do_sample,
-            "top_p": self.top_p,
-            "top_k": self.top_k,
-            "temperature": self.temperature,
-            "repetition_penalty": self.repetition_penalty,
-            "presence_penalty": self.presence_penalty,
-        }
-        try:
-            output_ids = self._model.generate(**inputs, **generate_kwargs)
-        except TypeError:
-            # Some transformers versions do not support `presence_penalty` in generate().
-            generate_kwargs.pop("presence_penalty", None)
-            output_ids = self._model.generate(**inputs, **generate_kwargs)
-
-        generated_ids = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, output_ids)
-        ]
-        generated_text = self._processor.batch_decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
-
-        # parse first JSON object from generation
-        start = generated_text.find("{")
-        end = generated_text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise ValueError(f"Model output is not valid JSON: {generated_text}")
-        payload = generated_text[start : end + 1]
-        return json.loads(payload)
 
 
 class GlobalItemDB:
@@ -455,24 +527,50 @@ def _sample_distinct_user_item_rows(
     return picked
 
 
+def _write_jsonl(path: str | Path, records: List[Dict[str, Any]]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for row in records:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _export_sqlite_table_as_jsonl(db_path: str | Path, table: str, out_path: str | Path) -> None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(f"SELECT * FROM {table}")
+        rows = [dict(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+    _write_jsonl(out_path, rows)
+
+
 if __name__ == "__main__":
     # Real runnable example:
     # - randomly sample 10 candidate items from item DB
     # - randomly sample 10 user-history interactions from user DB
     # - run both profilers and print profile outputs
     random_seed = 2025
-    sample_k = 10
+    sample_k = 4
     item_desc_tsv_path = "./processed/Video_Games_item_desc.tsv"
     user_pairs_tsv_path = "./processed/Video_Games_u_i_pairs.tsv"
+    run_tag = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_out_dir = Path(f"./processed/profiler_runs/{run_tag}")
+    run_out_dir.mkdir(parents=True, exist_ok=True)
+    global_db_path = "./processed/global_item_features.db"
+    history_db_path = "./processed/user_history_log.db"
 
     candidate_profiler, history_profiler = bootstrap_agents_from_processed(
         item_desc_tsv=item_desc_tsv_path,
-        global_db_path="./processed/global_item_features.db",
-        history_db_path="./processed/user_history_log.db",
+        global_db_path=global_db_path,
+        history_db_path=history_db_path,
     )
 
     item_map = load_item_desc_tsv(item_desc_tsv_path)
     sampled_item_ids = _sample_distinct_items(item_map, k=sample_k, seed=random_seed)
+    candidate_meta_records: List[Dict[str, Any]] = []
+    candidate_profile_records: List[Dict[str, Any]] = []
 
     print(f"\n[Agent 1] Running candidate profiling on {len(sampled_item_ids)} sampled items...")
     for idx, item_id in enumerate(sampled_item_ids, start=1):
@@ -485,7 +583,15 @@ if __name__ == "__main__":
             detail_images=[],
             category_hint="Video_Games",
         )
+        candidate_meta_records.append(asdict(sample_item))
         profile = candidate_profiler.profile_and_store(sample_item)
+        candidate_profile_records.append(
+            {
+                "item_id": item_id,
+                "source": "candidate",
+                "profile": profile,
+            }
+        )
         print(f"\n[Agent 1][{idx}/{len(sampled_item_ids)}] item_id={item_id}")
         print(json.dumps(profile, ensure_ascii=False, indent=2))
 
@@ -494,6 +600,8 @@ if __name__ == "__main__":
         k=sample_k,
         seed=random_seed,
     )
+    history_meta_records: List[Dict[str, Any]] = []
+    history_profile_records: List[Dict[str, Any]] = []
 
     print(f"\n[Agent 2] Running history profiling on {len(sampled_user_rows)} sampled user-item rows...")
     for idx, row in enumerate(sampled_user_rows, start=1):
@@ -512,9 +620,38 @@ if __name__ == "__main__":
             behavior="positive",
             timestamp=timestamp,
         )
+        history_meta_records.append(asdict(hist_item))
         profile = history_profiler.profile_and_store(hist_item)
+        history_profile_records.append(
+            {
+                "user_id": user_id,
+                "item_id": item_id,
+                "timestamp": timestamp,
+                "source": "history",
+                "profile": profile,
+            }
+        )
         print(
             f"\n[Agent 2][{idx}/{len(sampled_user_rows)}] "
             f"user_id={user_id}, item_id={item_id}, ts={timestamp}"
         )
         print(json.dumps(profile, ensure_ascii=False, indent=2))
+
+    # Save meta and generated profiles for manual verification.
+    _write_jsonl(run_out_dir / "candidate_meta.jsonl", candidate_meta_records)
+    _write_jsonl(run_out_dir / "history_meta.jsonl", history_meta_records)
+    _write_jsonl(run_out_dir / "candidate_profiles.jsonl", candidate_profile_records)
+    _write_jsonl(run_out_dir / "history_profiles.jsonl", history_profile_records)
+
+    # Snapshot DB tables into jsonl for easy manual diff/check.
+    _export_sqlite_table_as_jsonl(
+        global_db_path,
+        "global_item_features",
+        run_out_dir / "global_item_features_snapshot.jsonl",
+    )
+    _export_sqlite_table_as_jsonl(
+        history_db_path,
+        "user_history_profiles",
+        run_out_dir / "user_history_profiles_snapshot.jsonl",
+    )
+    print(f"\nSaved run artifacts to: {run_out_dir.resolve()}")
