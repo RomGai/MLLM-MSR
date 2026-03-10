@@ -132,7 +132,7 @@ class Qwen3VLExtractor:
             "top_k": self.top_k,
             "temperature": 0.0 if force_greedy else self.temperature,
             "repetition_penalty": self.repetition_penalty,
-            "presence_penalty": self.presence_penalty,
+#            "presence_penalty": self.presence_penalty,
         }
         if force_greedy:
             generate_kwargs.pop("top_p", None)
