@@ -509,12 +509,9 @@ def bootstrap_agents_from_processed(
 def _sample_distinct_items(
     item_map: Dict[str, Dict[str, str]],
     k: int,
-    seed: int = 2025,
 ) -> List[str]:
-    """Sample up to k distinct item_ids from item metadata map."""
+    """Take up to k distinct item_ids in original order from item metadata map."""
     item_ids = list(item_map.keys())
-    rng = random.Random(seed)
-    rng.shuffle(item_ids)
     return item_ids[: min(k, len(item_ids))]
 
 
@@ -591,7 +588,6 @@ def _build_user_item_timestamp_map(user_pairs_tsv_path: str | Path) -> Dict[tupl
 def _pick_multi_user_labeled_sequences(
     user_pairs_tsv_path: str | Path,
     user_items_negs_path: str | Path,
-    seed: int = 2025,
     num_users: int = 2,
     max_rows: int = 500,
 ) -> List[Dict[str, Any]]:
@@ -621,10 +617,8 @@ def _pick_multi_user_labeled_sequences(
     if not grouped:
         return []
 
+    # Keep file encounter order (dict insertion order) and pick first N users.
     users = list(grouped.keys())
-    rng = random.Random(seed)
-    rng.shuffle(users)
-    users.sort(key=lambda u: len(grouped[u]), reverse=True)
     selected_users = users[: max(1, num_users)]
     merged: List[Dict[str, Any]] = []
     for uid in selected_users:
@@ -632,8 +626,7 @@ def _pick_multi_user_labeled_sequences(
         seq.sort(key=lambda r: int(r["timestamp"]))
         merged.extend(seq[:max_rows])
 
-    # Keep deterministic global processing order for readability.
-    merged.sort(key=lambda r: (str(r["user_id"]), int(r["timestamp"])))
+    # Keep per-user timestamp order and selected user order.
     return merged
 
 
@@ -661,8 +654,7 @@ if __name__ == "__main__":
     # - warm up candidate item profiles with batched runs
     # - pick two users and run full labeled history sequence modeling by timestamp order
     # - run both profilers and print profile outputs
-    random_seed = 2025
-    sample_k = int(os.getenv("candidate_sample_k", "10"))
+    sample_k = int(os.getenv("candidate_sample_k", "5"))
     batch_size = int(os.getenv("batch_size", "64"))
     max_history_rows = int(os.getenv("max_history_rows", "500"))
     item_desc_tsv_path = "./processed/Video_Games_item_desc.tsv"
@@ -680,7 +672,7 @@ if __name__ == "__main__":
     )
 
     item_map = load_item_desc_tsv(item_desc_tsv_path)
-    sampled_item_ids = _sample_distinct_items(item_map, k=sample_k, seed=random_seed)
+    sampled_item_ids = _sample_distinct_items(item_map, k=sample_k)
     candidate_meta_records: List[Dict[str, Any]] = []
     candidate_profile_records: List[Dict[str, Any]] = []
 
@@ -723,7 +715,6 @@ if __name__ == "__main__":
     sampled_user_rows = _pick_multi_user_labeled_sequences(
         user_pairs_tsv_path,
         user_items_negs_tsv_path,
-        seed=random_seed,
         num_users=2,
         max_rows=max_history_rows,
     )

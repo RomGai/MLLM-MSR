@@ -82,7 +82,7 @@ history_profiler.profile_and_store(hist_item)
 
 直接执行 `python item_profiler_agents.py` 时，会：
 
-1. 从 `*_item_desc.tsv` 随机抽取最多 10 个不同商品 `item_id` 跑 Agent 1；
+1. 从 `*_item_desc.tsv` 按顺序抽取前 5 个商品 `item_id` 跑 Agent 1；
 2. 从 `*_user_items_negs.tsv` 读取正负标签，并与 `*_u_i_pairs.tsv` 的时间戳进行关联，选择 2 个用户分别按时间戳升序进行完整序列建模；
 3. 将两类 profile 写入本地 SQLite，并在终端打印每条 profile 的 JSON 结果。
 
@@ -125,6 +125,6 @@ history_profiler.profile_and_store(hist_item)
   - 候选/历史建模前先查 `global_item_features`，已存在则直接复用；
   - 写入 `user_history_profiles` 前先检查 `(user_id,item_id,behavior,timestamp)`，已存在则跳过插入。
 - 关键环境变量补充：
-  - `candidate_sample_k`：候选热启动样本数（默认 10）
+  - `candidate_sample_k`：候选热启动样本数（默认 5）
   - `max_history_rows`：单用户历史最大序列长度（默认 500）
   - `batch_size`：批处理进度粒度（默认 64）
