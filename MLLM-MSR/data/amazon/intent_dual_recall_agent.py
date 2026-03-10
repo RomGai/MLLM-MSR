@@ -370,6 +370,7 @@ class GlobalHistoryAccessor:
         user_id: str,
         lookback: int = 200,
         min_positive_first: bool = True,
+        top_category_paths_k: int = 3,
         top_item_types_k: int = 3,
     ) -> RoutingResult:
         """Infer category intent from user history when query is empty.
@@ -418,7 +419,9 @@ class GlobalHistoryAccessor:
             if item_type:
                 type_cnt[item_type] = type_cnt.get(item_type, 0) + 1
 
-        top_cats = sorted(cat_cnt.items(), key=lambda x: (-x[1], x[0]))[:3]
+        top_cats = sorted(cat_cnt.items(), key=lambda x: (-x[1], x[0]))[
+            : max(1, int(top_category_paths_k))
+        ]
         top_types = sorted(type_cnt.items(), key=lambda x: (-x[1], x[0]))[: max(1, int(top_item_types_k))]
         paths = [[seg.strip() for seg in cat.split(">") if seg.strip()] for cat, _ in top_cats]
         item_types = [t for t, _ in top_types]
@@ -449,6 +452,7 @@ class RoutingRecallAgent:
         min_candidate_items: int = 20,
         max_candidate_items: int = 200,
         max_history_rows: int = 200,
+        interested_category_paths_k: int = 3,
         interested_item_types_k: int = 3,
     ) -> IntentDualRecallOutput:
         clean_query = (query or "").strip()
@@ -458,6 +462,7 @@ class RoutingRecallAgent:
         else:
             routing = self.accessor.infer_user_intent_from_history(
                 user_id=user_id,
+                top_category_paths_k=interested_category_paths_k,
                 top_item_types_k=interested_item_types_k,
             )
 
@@ -502,6 +507,7 @@ class RoutingRecallAgent:
                 "reasoning": routing.reasoning,
                 "selected_category_paths": routing.category_paths,
                 "selected_item_types": routing.item_types,
+                "interested_category_paths_k": max(1, int(interested_category_paths_k)),
                 "interested_item_types_k": max(1, int(interested_item_types_k)),
                 "history_top_item_types": history_top_item_types,
                 "final_rollup_paths": final_rollup_paths,
