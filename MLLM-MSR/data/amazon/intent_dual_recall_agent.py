@@ -16,7 +16,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
     import torch
@@ -304,11 +304,73 @@ class GlobalHistoryAccessor:
                 break
         return results
 
+    def recall_user_history_all(
+        self,
+        user_id: str,
+        max_rows: int = 300,
+    ) -> List[Dict[str, Any]]:
+        """Return all recent history rows for the user (no relevance filtering)."""
+        rows = self.history_conn.execute(
+            """
+            SELECT user_id, item_id, behavior, timestamp, profile_json, created_at
+            FROM user_history_profiles
+            WHERE user_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (str(user_id), int(max_rows)),
+        ).fetchall()
+
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            profile = json.loads(row["profile_json"])
+            results.append(
+                {
+                    "user_id": row["user_id"],
+                    "item_id": row["item_id"],
+                    "behavior": row["behavior"],
+                    "timestamp": row["timestamp"],
+                    "profile": profile,
+                    "created_at": row["created_at"],
+                }
+            )
+        return results
+
+    def _top_item_types_from_history(
+        self,
+        user_id: str,
+        top_k: int = 3,
+        lookback: int = 300,
+    ) -> List[str]:
+        """Infer top-k interested item types from recent history."""
+        rows = self.history_conn.execute(
+            """
+            SELECT profile_json
+            FROM user_history_profiles
+            WHERE user_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (str(user_id), int(lookback)),
+        ).fetchall()
+        type_cnt: Dict[str, int] = {}
+        for row in rows:
+            try:
+                profile = json.loads(row["profile_json"])
+            except json.JSONDecodeError:
+                continue
+            _path, item_type = self._extract_taxonomy(profile)
+            if item_type:
+                type_cnt[item_type] = type_cnt.get(item_type, 0) + 1
+        ranked = sorted(type_cnt.items(), key=lambda x: (-x[1], x[0]))
+        return [t for t, _ in ranked[: max(1, int(top_k))]]
+
     def infer_user_intent_from_history(
         self,
         user_id: str,
         lookback: int = 200,
         min_positive_first: bool = True,
+        top_item_types_k: int = 3,
     ) -> RoutingResult:
         """Infer category intent from user history when query is empty.
 
@@ -357,7 +419,7 @@ class GlobalHistoryAccessor:
                 type_cnt[item_type] = type_cnt.get(item_type, 0) + 1
 
         top_cats = sorted(cat_cnt.items(), key=lambda x: (-x[1], x[0]))[:3]
-        top_types = sorted(type_cnt.items(), key=lambda x: (-x[1], x[0]))[:5]
+        top_types = sorted(type_cnt.items(), key=lambda x: (-x[1], x[0]))[: max(1, int(top_item_types_k))]
         paths = [[seg.strip() for seg in cat.split(">") if seg.strip()] for cat, _ in top_cats]
         item_types = [t for t, _ in top_types]
 
@@ -387,13 +449,28 @@ class RoutingRecallAgent:
         min_candidate_items: int = 20,
         max_candidate_items: int = 200,
         max_history_rows: int = 200,
+        interested_item_types_k: int = 3,
     ) -> IntentDualRecallOutput:
         clean_query = (query or "").strip()
         category_catalog, item_type_catalog = self.accessor.category_catalog()
         if clean_query:
             routing = self.llm.route(clean_query, category_catalog, item_type_catalog)
         else:
-            routing = self.accessor.infer_user_intent_from_history(user_id=user_id)
+            routing = self.accessor.infer_user_intent_from_history(
+                user_id=user_id,
+                top_item_types_k=interested_item_types_k,
+            )
+
+        history_top_item_types = self.accessor._top_item_types_from_history(
+            user_id=user_id,
+            top_k=interested_item_types_k,
+        )
+
+        merged_item_types: List[str] = []
+        for t in [*routing.item_types, *history_top_item_types]:
+            if t and t not in merged_item_types:
+                merged_item_types.append(t)
+        routing.item_types = merged_item_types[: max(1, int(interested_item_types_k))]
 
         if not routing.category_paths and routing.item_types:
             routing.category_paths = [[routing.item_types[0]]]
@@ -404,12 +481,19 @@ class RoutingRecallAgent:
             min_items=min_candidate_items,
             max_items=max_candidate_items,
         )
-        history_rows = self.accessor.recall_user_history(
-            user_id=user_id,
-            target_paths=final_rollup_paths,
-            target_item_types=routing.item_types,
-            max_rows=max_history_rows,
-        )
+
+        if clean_query:
+            history_rows = self.accessor.recall_user_history(
+                user_id=user_id,
+                target_paths=final_rollup_paths,
+                target_item_types=routing.item_types,
+                max_rows=max_history_rows,
+            )
+        else:
+            history_rows = self.accessor.recall_user_history_all(
+                user_id=user_id,
+                max_rows=max_history_rows,
+            )
 
         return IntentDualRecallOutput(
             query=clean_query,
@@ -418,6 +502,8 @@ class RoutingRecallAgent:
                 "reasoning": routing.reasoning,
                 "selected_category_paths": routing.category_paths,
                 "selected_item_types": routing.item_types,
+                "interested_item_types_k": max(1, int(interested_item_types_k)),
+                "history_top_item_types": history_top_item_types,
                 "final_rollup_paths": final_rollup_paths,
                 "catalog_size": {
                     "category_paths": len(category_catalog),

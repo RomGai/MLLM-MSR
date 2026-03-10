@@ -45,6 +45,7 @@
 1. 读取该用户最近 `lookback` 条历史（默认 200）。
 2. 优先使用 `positive` 行为记录；若没有，再回退到全部近期记录。
 3. 按 `taxonomy.category_path` 与 `taxonomy.item_type` 做频次统计，取 top 类目/类型作为本次路由目标。
+4. 路 B 在该模式下不再做相关性过滤，而是返回该用户近期**全部历史记录**（按时间倒序）。
 
 ### 职责 2：动态上卷双路召回
 
@@ -71,12 +72,15 @@
 
 `RoutingRecallAgent.run(...)` 输出结构：
 - `candidate_items`: 路 A 召回商品集合
-- `query_relevant_history`: 路 B 历史相关记录
+- `query_relevant_history`: 路 B 历史记录（有 query 时为相关子集；无 query 时为全部历史）
 - `routing`: 本次路由说明（选中类目、item_type、最终上卷层级）
 
 其中 `routing.reasoning` 会明确说明本次是 `LLM 路由` 还是 `query 为空时的历史推断`。
 
 可直接作为下一阶段排序/重排输入。
+补充参数：
+- `interested_item_types_k`（默认 `3`）：无论 query 是否为空，都会结合用户历史推断 top-k 兴趣 `item_type`，并与路由类型合并后用于路 A 商品召回。
+
 
 ## 5. 最小使用示例
 
