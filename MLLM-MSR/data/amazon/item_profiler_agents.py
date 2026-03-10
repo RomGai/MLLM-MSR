@@ -51,7 +51,17 @@ class ItemProfileInput:
 class HistoryItemProfileInput(ItemProfileInput):
     user_id: str = ""
     behavior: BehaviorLabel = "positive"
-    timestamp: int = 0
+    timestamp: Optional[int] = 0
+
+
+def _normalize_timestamp_for_db(ts: Optional[int]) -> int:
+    """Normalize optional timestamp to DB-safe integer.
+
+    Negative samples may have no real interaction timestamp. We store such cases as -1.
+    """
+    if ts is None:
+        return -1
+    return int(ts)
 
 
 class Qwen3VLExtractor:
@@ -122,7 +132,7 @@ class Qwen3VLExtractor:
             "top_k": self.top_k,
             "temperature": 0.0 if force_greedy else self.temperature,
             "repetition_penalty": self.repetition_penalty,
-            # "presence_penalty": self.presence_penalty,
+#            "presence_penalty": self.presence_penalty,
         }
         if force_greedy:
             generate_kwargs.pop("top_p", None)
@@ -319,9 +329,10 @@ class UserHistoryLogDB:
         user_id: str,
         item_id: str,
         behavior: BehaviorLabel,
-        timestamp: int,
+        timestamp: Optional[int],
         profile: Dict[str, Any],
     ) -> None:
+        timestamp_db = _normalize_timestamp_for_db(timestamp)
         self.conn.execute(
             """
             INSERT INTO user_history_profiles
@@ -332,21 +343,28 @@ class UserHistoryLogDB:
                 user_id,
                 item_id,
                 behavior,
-                int(timestamp),
+                timestamp_db,
                 json.dumps(profile, ensure_ascii=False),
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
         self.conn.commit()
 
-    def exists(self, user_id: str, item_id: str, behavior: BehaviorLabel, timestamp: int) -> bool:
+    def exists(
+        self,
+        user_id: str,
+        item_id: str,
+        behavior: BehaviorLabel,
+        timestamp: Optional[int],
+    ) -> bool:
+        timestamp_db = _normalize_timestamp_for_db(timestamp)
         cursor = self.conn.execute(
             """
             SELECT 1 FROM user_history_profiles
             WHERE user_id = ? AND item_id = ? AND behavior = ? AND timestamp = ?
             LIMIT 1
             """,
-            (str(user_id), str(item_id), str(behavior), int(timestamp)),
+            (str(user_id), str(item_id), str(behavior), timestamp_db),
         )
         return cursor.fetchone() is not None
 
@@ -590,21 +608,45 @@ def _pick_multi_user_labeled_sequences(
     user_items_negs_path: str | Path,
     num_users: int = 2,
     max_rows: int = 500,
-) -> List[Dict[str, Any]]:
-    """Pick multiple users from pos/neg labels and return labeled sequences sorted by timestamp.
+) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Pick multiple users from pos/neg labels and return labeled sequences.
 
-    Labels come from `*_user_items_negs.tsv`; timestamps are joined from `*_u_i_pairs.tsv`.
+    - Positive labels use timestamps joined from `*_u_i_pairs.tsv`.
+    - Negative labels are kept even when no timestamp exists (timestamp will be None).
     """
     ts_map = _build_user_item_timestamp_map(user_pairs_tsv_path)
+    stats = {
+        "pos_rows_in_negs": 0,
+        "neg_rows_in_negs": 0,
+        "pos_rows_with_timestamp": 0,
+        "neg_rows_with_timestamp": 0,
+        "rows_dropped_missing_timestamp": 0,
+        "neg_rows_without_timestamp_kept": 0,
+    }
 
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for row in expand_pos_neg_rows(user_items_negs_path):
         user_id = str(row["user_id"])
         item_id = str(row["item_id"])
         behavior = str(row["behavior"])
+        if behavior == "positive":
+            stats["pos_rows_in_negs"] += 1
+        elif behavior == "negative":
+            stats["neg_rows_in_negs"] += 1
+
         ts = ts_map.get((user_id, item_id))
-        if ts is None:
-            continue
+        if behavior == "positive":
+            if ts is None:
+                # Positive interactions should have real timestamps from interactions file.
+                stats["rows_dropped_missing_timestamp"] += 1
+                continue
+            stats["pos_rows_with_timestamp"] += 1
+        elif behavior == "negative":
+            if ts is None:
+                stats["neg_rows_without_timestamp_kept"] += 1
+            else:
+                stats["neg_rows_with_timestamp"] += 1
+
         grouped.setdefault(user_id, []).append(
             {
                 "user_id": user_id,
@@ -615,7 +657,7 @@ def _pick_multi_user_labeled_sequences(
         )
 
     if not grouped:
-        return []
+        return [], stats
 
     # Keep file encounter order (dict insertion order) and pick first N users.
     users = list(grouped.keys())
@@ -623,11 +665,20 @@ def _pick_multi_user_labeled_sequences(
     merged: List[Dict[str, Any]] = []
     for uid in selected_users:
         seq = grouped[uid]
-        seq.sort(key=lambda r: int(r["timestamp"]))
+        # Order rule:
+        # 1) positives first in strict chronological order (smaller/earlier timestamp first)
+        # 2) negatives after positives (timestamp not required)
+        seq.sort(
+            key=lambda r: (
+                0 if r["behavior"] == "positive" else 1,
+                int(r["timestamp"]) if r["timestamp"] is not None else 10**30,
+                str(r["item_id"]),
+            )
+        )
         merged.extend(seq[:max_rows])
 
     # Keep per-user timestamp order and selected user order.
-    return merged
+    return merged, stats
 
 
 def _write_jsonl(path: str | Path, records: List[Dict[str, Any]]) -> None:
@@ -712,7 +763,7 @@ if __name__ == "__main__":
         if idx % batch_size == 0:
             print(f"[Agent 1] batch progress: {idx}/{len(sampled_item_ids)}")
 
-    sampled_user_rows = _pick_multi_user_labeled_sequences(
+    sampled_user_rows, label_parse_stats = _pick_multi_user_labeled_sequences(
         user_pairs_tsv_path,
         user_items_negs_tsv_path,
         num_users=2,
@@ -722,6 +773,8 @@ if __name__ == "__main__":
     history_profile_records: List[Dict[str, Any]] = []
 
     chosen_user_ids = sorted({str(r["user_id"]) for r in sampled_user_rows})
+    print("\n[Agent 2] Parsed label/timestamp stats:")
+    print(json.dumps(label_parse_stats, ensure_ascii=False, indent=2))
     print(
         "\n[Agent 2] Running full-sequence history profiling "
         f"for user_ids={chosen_user_ids} with {len(sampled_user_rows)} interactions..."
@@ -729,7 +782,8 @@ if __name__ == "__main__":
     for idx, row in enumerate(sampled_user_rows, start=1):
         user_id = str(row["user_id"])
         item_id = str(row["item_id"])
-        timestamp = int(row["timestamp"])
+        timestamp_raw = row.get("timestamp")
+        timestamp: Optional[int] = None if timestamp_raw is None else int(timestamp_raw)
         meta = item_map.get(item_id, {"image": "", "summary": ""})
         hist_item = HistoryItemProfileInput(
             item_id=item_id,
@@ -761,7 +815,7 @@ if __name__ == "__main__":
             profile_source = "newly_profiled"
 
         profile["behavior"] = hist_item.behavior
-        profile["timestamp"] = int(hist_item.timestamp)
+        profile["timestamp"] = hist_item.timestamp
         profile["user_id"] = hist_item.user_id
         if not history_profiler.history_db.exists(
             user_id=hist_item.user_id,
