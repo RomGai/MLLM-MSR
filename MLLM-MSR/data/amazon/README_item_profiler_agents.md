@@ -86,6 +86,10 @@ history_profiler.profile_and_store(hist_item)
 2. 从 `*_user_items_negs.tsv` 读取正负标签，并与 `*_u_i_pairs.tsv` 的时间戳进行关联，选择 2 个用户分别按时间戳升序进行完整序列建模；
 3. 将两类 profile 写入本地 SQLite，并在终端打印每条 profile 的 JSON 结果。
 
+- 标签解析时会同时读取 `pos` 和 `neg`；并打印统计信息（总量、成功关联到时间戳的条数、因缺失时间戳被丢弃条数）。
+- 历史序列中：positive 严格按 `*_u_i_pairs.tsv` 的原始时间戳升序排序（时间戳小/更早在前）；negative 不要求时间戳，缺失时间戳也会保留并参与建模。
+- 对于无时间戳的 negative 样本：profile 中保留 `timestamp=null`，写入 `user_history_profiles` 时使用 `-1` 作为占位时间戳，避免 `int(None)` 异常。
+
 ## Qwen3-VL 官方式推理参数
 
 `Qwen3VLExtractor` 读取如下环境变量来控制生成：
