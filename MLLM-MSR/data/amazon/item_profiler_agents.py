@@ -14,14 +14,26 @@ The implementation is designed for Qwen3VL-8B style multimodal models.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import random
 import sqlite3
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional
+from urllib.parse import urlparse
 
-from PIL import Image
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover - optional dependency
+    Image = None
+
+try:
+    import requests
+except Exception:  # pragma: no cover - optional dependency
+    requests = None
 
 try:
     import torch
@@ -90,6 +102,37 @@ class Qwen3VLExtractor:
         if self.device != "cuda":
             self._model.to(self.device)
 
+    @staticmethod
+    def _is_url(path_or_url: str) -> bool:
+        parsed = urlparse(path_or_url)
+        return parsed.scheme in {"http", "https"}
+
+    @staticmethod
+    def _cache_remote_image(url: str, cache_dir: Path) -> Path:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        ext = Path(urlparse(url).path).suffix or ".jpg"
+        file_name = hashlib.sha256(url.encode("utf-8")).hexdigest() + ext
+        target = cache_dir / file_name
+        if target.exists():
+            return target
+
+        if requests is not None:
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            target.write_bytes(response.content)
+        else:
+            with urllib.request.urlopen(url, timeout=20) as response:
+                target.write_bytes(response.read())
+        return target
+
+    def _open_image(self, path_or_url: str):
+        if Image is None:
+            raise ImportError("Pillow is not available. Install Pillow first.")
+        if self._is_url(path_or_url):
+            cached = self._cache_remote_image(path_or_url, Path("./processed/image_cache"))
+            return Image.open(cached).convert("RGB")
+        return Image.open(path_or_url).convert("RGB")
+
     def extract(
         self,
         prompt: str,
@@ -97,7 +140,7 @@ class Qwen3VLExtractor:
     ) -> Dict[str, Any]:
         self.load()
 
-        images = [Image.open(path).convert("RGB") for path in image_paths]
+        images = [self._open_image(path) for path in image_paths]
         messages = [
             {
                 "role": "user",
@@ -241,15 +284,18 @@ Item text fields:
 - category_hint: {item.category_hint or ''}
 
 User shopping-oriented extraction requirements:
-1) Taxonomy: category_l1/l2/l3, use_case, target_people, seasonality.
+1) Type-first taxonomy (important):
+   - Always output `item_type` (required).
+   - If hierarchical category is uncertain, keep only `item_type` and leave `category_path` empty.
+   - If known, output `category_path` as a list (e.g., ["Electronics", "Gaming", "Headset"]).
+   - Also infer use_case, target_people, seasonality.
 2) Textual attribute tags (fine-grained):
+   - title keyword summary (must leverage title)
    - material/fabric composition
    - core features & specs (size, capacity, weight, dimensions, compatibility, power, ingredients)
    - package/bundle information
    - quality & durability claims
    - comfort/usability claims
-   - maintenance/care instructions
-   - safety/compliance cues
    - price_band inference (budget/mid/premium) and value_for_money signal
 3) Visual style tags (from images):
    - dominant colors (+ optional hex-like names)
@@ -259,11 +305,7 @@ User shopping-oriented extraction requirements:
    - pattern/print/logo density
    - scene mood (homey, professional, outdoor, gaming, etc.)
    - perceived quality level (low/medium/high with confidence)
-4) Purchase decision cues:
-   - key selling points (<=5)
-   - likely concerns/risks (<=5)
-   - recommended matching scenarios (<=5)
-5) Output quality:
+4) Output quality:
    - Every major field must include a confidence in [0,1].
    - Put uncertain values under "hypotheses".
    - Output ONLY one JSON object. No markdown.
@@ -271,10 +313,17 @@ User shopping-oriented extraction requirements:
 JSON schema:
 {{
   "item_id": "{item.item_id}",
-  "taxonomy": {{...}},
+  "title": "{item.title}",
+  "taxonomy": {{
+    "item_type": "",
+    "category_path": [],
+    "use_case": [],
+    "target_people": [],
+    "seasonality": "",
+    "confidence": 0.0
+  }},
   "text_tags": {{...}},
   "visual_tags": {{...}},
-  "decision_cues": {{...}},
   "hypotheses": ["..."],
   "overall_confidence": 0.0
 }}
@@ -373,31 +422,108 @@ def bootstrap_agents_from_processed(
     return CandidateItemProfiler(extractor, global_db), HistoryItemProfiler(extractor, history_db)
 
 
+def _sample_distinct_items(
+    item_map: Dict[str, Dict[str, str]],
+    k: int,
+    seed: int = 2025,
+) -> List[str]:
+    """Sample up to k distinct item_ids from item metadata map."""
+    item_ids = list(item_map.keys())
+    rng = random.Random(seed)
+    rng.shuffle(item_ids)
+    return item_ids[: min(k, len(item_ids))]
+
+
+def _sample_distinct_user_item_rows(
+    rows: Iterable[Dict[str, str]],
+    k: int,
+    seed: int = 2025,
+) -> List[Dict[str, str]]:
+    """Sample up to k rows with distinct user_id and item_id."""
+    all_rows = list(rows)
+    rng = random.Random(seed)
+    rng.shuffle(all_rows)
+
+    picked: List[Dict[str, str]] = []
+    used_users = set()
+    used_items = set()
+
+    for row in all_rows:
+        user_id = str(row.get("user_id", ""))
+        item_id = str(row.get("item_id", ""))
+        if not user_id or not item_id:
+            continue
+        if user_id in used_users or item_id in used_items:
+            continue
+        picked.append(row)
+        used_users.add(user_id)
+        used_items.add(item_id)
+        if len(picked) >= k:
+            break
+
+    return picked
+
+
 if __name__ == "__main__":
-    # Minimal usage example (expects local images and valid model setup).
+    # Real runnable example:
+    # - randomly sample 10 candidate items from item DB
+    # - randomly sample 10 user-history interactions from user DB
+    # - run both profilers and print profile outputs
+    random_seed = 2025
+    sample_k = 10
+    item_desc_tsv_path = "./processed/Video_Games_item_desc.tsv"
+    user_pairs_tsv_path = "./processed/Video_Games_u_i_pairs.tsv"
+
     candidate_profiler, history_profiler = bootstrap_agents_from_processed(
-        item_desc_tsv="./processed/Video_Games_item_desc.tsv",
+        item_desc_tsv=item_desc_tsv_path,
         global_db_path="./processed/global_item_features.db",
         history_db_path="./processed/user_history_log.db",
     )
 
-    sample_item = ItemProfileInput(
-        item_id="0",
-        title="Sample title",
-        detail_text="Sample detail text for profiling.",
-        main_image="./images/0.jpg",
-        detail_images=[],
-        price="$19.99",
-        brand="ExampleBrand",
-        category_hint="Video Games",
+    item_map = load_item_desc_tsv(item_desc_tsv_path)
+    sampled_item_ids = _sample_distinct_items(item_map, k=sample_k, seed=random_seed)
+
+    print(f"\n[Agent 1] Running candidate profiling on {len(sampled_item_ids)} sampled items...")
+    for idx, item_id in enumerate(sampled_item_ids, start=1):
+        meta = item_map[item_id]
+        sample_item = ItemProfileInput(
+            item_id=item_id,
+            title=f"item_{item_id}",
+            detail_text=meta.get("summary", "") or "",
+            main_image=meta.get("image", ""),
+            detail_images=[],
+            category_hint="Video_Games",
+        )
+        profile = candidate_profiler.profile_and_store(sample_item)
+        print(f"\n[Agent 1][{idx}/{len(sampled_item_ids)}] item_id={item_id}")
+        print(json.dumps(profile, ensure_ascii=False, indent=2))
+
+    sampled_user_rows = _sample_distinct_user_item_rows(
+        load_user_interactions(user_pairs_tsv_path),
+        k=sample_k,
+        seed=random_seed,
     )
 
-    print("Agent 1 API ready:", asdict(sample_item))
-
-    sample_hist_item = HistoryItemProfileInput(
-        **asdict(sample_item),
-        user_id="123",
-        behavior="positive",
-        timestamp=1710000000000,
-    )
-    print("Agent 2 API ready:", asdict(sample_hist_item))
+    print(f"\n[Agent 2] Running history profiling on {len(sampled_user_rows)} sampled user-item rows...")
+    for idx, row in enumerate(sampled_user_rows, start=1):
+        user_id = str(row["user_id"])
+        item_id = str(row["item_id"])
+        timestamp = int(row["timestamp"])
+        meta = item_map.get(item_id, {"image": "", "summary": ""})
+        hist_item = HistoryItemProfileInput(
+            item_id=item_id,
+            title=f"item_{item_id}",
+            detail_text=meta.get("summary", "") or "",
+            main_image=meta.get("image", ""),
+            detail_images=[],
+            category_hint="Video_Games",
+            user_id=user_id,
+            behavior="positive",
+            timestamp=timestamp,
+        )
+        profile = history_profiler.profile_and_store(hist_item)
+        print(
+            f"\n[Agent 2][{idx}/{len(sampled_user_rows)}] "
+            f"user_id={user_id}, item_id={item_id}, ts={timestamp}"
+        )
+        print(json.dumps(profile, ensure_ascii=False, indent=2))

@@ -13,6 +13,13 @@
 - `*_u_i_pairs.tsv`: `user_id, item_id, timestamp`
 - `*_user_items_negs.tsv`: `user_id, pos, neg`
 
+## 图片来源说明（你问的重点）
+
+- 两种都支持：
+  1. **线上 URL**（例如 `*_item_desc.tsv` 里的 `image` 字段）
+  2. **本地文件路径**
+- 若传入 URL，`item_profiler_agents.py` 会自动下载并缓存到 `./processed/image_cache/`，后续重复使用同一 URL 会直接命中缓存。
+
 ## 输出数据库
 
 - 全局商品特征库（Global Item DB）
@@ -25,9 +32,9 @@
 
 ## 关键能力
 
-1. 细粒度文本标签抽取（类目、特征、规格、价格带、适用人群等）
+1. Type-first 细粒度文本标签抽取（`item_type` 必填，`category_path` 可空）
 2. 细粒度视觉风格抽取（色彩、版型、风格、材质质感、氛围感等）
-3. 结构化 JSON 输出并落库
+3. 输出 JSON 显式保留 `title` 字段并落库
 4. Agent 2 增强行为标签与时间戳
 
 ## 快速使用
@@ -68,3 +75,12 @@ history_profiler.profile_and_store(hist_item)
 ```
 
 > 注：若环境无 GPU/模型权重，代码可完成模块搭建但无法执行真实推理。
+
+## `__main__` 实际运行行为
+
+直接执行 `python item_profiler_agents.py` 时，会：
+
+1. 从 `*_item_desc.tsv` 随机抽取最多 10 个不同商品 `item_id` 跑 Agent 1；
+2. 从 `*_u_i_pairs.tsv` 随机抽取最多 10 条不同 `user_id` 且不同 `item_id` 的交互跑 Agent 2；
+3. 将两类 profile 写入本地 SQLite，并在终端打印每条 profile 的 JSON 结果。
+
