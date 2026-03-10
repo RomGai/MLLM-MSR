@@ -339,6 +339,17 @@ class UserHistoryLogDB:
         )
         self.conn.commit()
 
+    def exists(self, user_id: str, item_id: str, behavior: BehaviorLabel, timestamp: int) -> bool:
+        cursor = self.conn.execute(
+            """
+            SELECT 1 FROM user_history_profiles
+            WHERE user_id = ? AND item_id = ? AND behavior = ? AND timestamp = ?
+            LIMIT 1
+            """,
+            (str(user_id), str(item_id), str(behavior), int(timestamp)),
+        )
+        return cursor.fetchone() is not None
+
 
 def build_profile_prompt(item: ItemProfileInput) -> str:
     """Prompt template for fine-grained textual + visual profiling."""
@@ -564,6 +575,68 @@ def _pick_single_user_full_sequence(
     return seq
 
 
+def _build_user_item_timestamp_map(user_pairs_tsv_path: str | Path) -> Dict[tuple[str, str], int]:
+    """Build (user_id, item_id) -> latest timestamp map from u_i_pairs."""
+    ts_map: Dict[tuple[str, str], int] = {}
+    for row in load_user_interactions(user_pairs_tsv_path):
+        user_id = str(row.get("user_id", ""))
+        item_id = str(row.get("item_id", ""))
+        ts = int(row.get("timestamp", 0))
+        key = (user_id, item_id)
+        if key not in ts_map or ts > ts_map[key]:
+            ts_map[key] = ts
+    return ts_map
+
+
+def _pick_multi_user_labeled_sequences(
+    user_pairs_tsv_path: str | Path,
+    user_items_negs_path: str | Path,
+    seed: int = 2025,
+    num_users: int = 2,
+    max_rows: int = 500,
+) -> List[Dict[str, Any]]:
+    """Pick multiple users from pos/neg labels and return labeled sequences sorted by timestamp.
+
+    Labels come from `*_user_items_negs.tsv`; timestamps are joined from `*_u_i_pairs.tsv`.
+    """
+    ts_map = _build_user_item_timestamp_map(user_pairs_tsv_path)
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in expand_pos_neg_rows(user_items_negs_path):
+        user_id = str(row["user_id"])
+        item_id = str(row["item_id"])
+        behavior = str(row["behavior"])
+        ts = ts_map.get((user_id, item_id))
+        if ts is None:
+            continue
+        grouped.setdefault(user_id, []).append(
+            {
+                "user_id": user_id,
+                "item_id": item_id,
+                "behavior": behavior,
+                "timestamp": ts,
+            }
+        )
+
+    if not grouped:
+        return []
+
+    users = list(grouped.keys())
+    rng = random.Random(seed)
+    rng.shuffle(users)
+    users.sort(key=lambda u: len(grouped[u]), reverse=True)
+    selected_users = users[: max(1, num_users)]
+    merged: List[Dict[str, Any]] = []
+    for uid in selected_users:
+        seq = grouped[uid]
+        seq.sort(key=lambda r: int(r["timestamp"]))
+        merged.extend(seq[:max_rows])
+
+    # Keep deterministic global processing order for readability.
+    merged.sort(key=lambda r: (str(r["user_id"]), int(r["timestamp"])))
+    return merged
+
+
 def _write_jsonl(path: str | Path, records: List[Dict[str, Any]]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -585,15 +658,17 @@ def _export_sqlite_table_as_jsonl(db_path: str | Path, table: str, out_path: str
 
 if __name__ == "__main__":
     # Real runnable example:
-    # - randomly sample 10 candidate items from item DB
-    # - pick one user and run full history sequence modeling by timestamp order
+    # - warm up candidate item profiles with batched runs
+    # - pick two users and run full labeled history sequence modeling by timestamp order
     # - run both profilers and print profile outputs
     random_seed = 2025
-    sample_k = 10
+    sample_k = int(os.getenv("candidate_sample_k", "10"))
+    batch_size = int(os.getenv("batch_size", "64"))
+    max_history_rows = int(os.getenv("max_history_rows", "500"))
     item_desc_tsv_path = "./processed/Video_Games_item_desc.tsv"
     user_pairs_tsv_path = "./processed/Video_Games_u_i_pairs.tsv"
-    run_tag = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    run_out_dir = Path(f"./processed/profiler_runs/{run_tag}")
+    user_items_negs_tsv_path = "./processed/Video_Games_user_items_negs.tsv"
+    run_out_dir = Path("./processed/profiler_runs/shared")
     run_out_dir.mkdir(parents=True, exist_ok=True)
     global_db_path = "./processed/global_item_features.db"
     history_db_path = "./processed/user_history_log.db"
@@ -609,7 +684,10 @@ if __name__ == "__main__":
     candidate_meta_records: List[Dict[str, Any]] = []
     candidate_profile_records: List[Dict[str, Any]] = []
 
-    print(f"\n[Agent 1] Running candidate profiling on {len(sampled_item_ids)} sampled items...")
+    print(
+        f"\n[Agent 1] Batch profiling warm-up on {len(sampled_item_ids)} sampled items "
+        f"(batch_size={batch_size}) with incremental reuse..."
+    )
     for idx, item_id in enumerate(sampled_item_ids, start=1):
         meta = item_map[item_id]
         sample_item = ItemProfileInput(
@@ -621,28 +699,41 @@ if __name__ == "__main__":
             category_hint="Video_Games",
         )
         candidate_meta_records.append(asdict(sample_item))
-        profile = candidate_profiler.profile_and_store(sample_item)
+        profile = candidate_profiler.global_db.get_profile(item_id)
+        profile_source = "global_db_reused"
+        if profile is None:
+            profile = candidate_profiler.profile_and_store(sample_item)
+            profile_source = "newly_profiled"
         candidate_profile_records.append(
             {
                 "item_id": item_id,
                 "source": "candidate",
+                "profile_source": profile_source,
                 "profile": profile,
             }
         )
-        print(f"\n[Agent 1][{idx}/{len(sampled_item_ids)}] item_id={item_id}")
+        print(
+            f"\n[Agent 1][{idx}/{len(sampled_item_ids)}] item_id={item_id}, "
+            f"profile_source={profile_source}"
+        )
         print(json.dumps(profile, ensure_ascii=False, indent=2))
+        if idx % batch_size == 0:
+            print(f"[Agent 1] batch progress: {idx}/{len(sampled_item_ids)}")
 
-    sampled_user_rows = _pick_single_user_full_sequence(
-        load_user_interactions(user_pairs_tsv_path),
+    sampled_user_rows = _pick_multi_user_labeled_sequences(
+        user_pairs_tsv_path,
+        user_items_negs_tsv_path,
         seed=random_seed,
+        num_users=2,
+        max_rows=max_history_rows,
     )
     history_meta_records: List[Dict[str, Any]] = []
     history_profile_records: List[Dict[str, Any]] = []
 
-    chosen_user_id = sampled_user_rows[0]["user_id"] if sampled_user_rows else ""
+    chosen_user_ids = sorted({str(r["user_id"]) for r in sampled_user_rows})
     print(
         "\n[Agent 2] Running full-sequence history profiling "
-        f"for user_id={chosen_user_id} with {len(sampled_user_rows)} interactions..."
+        f"for user_ids={chosen_user_ids} with {len(sampled_user_rows)} interactions..."
     )
     for idx, row in enumerate(sampled_user_rows, start=1):
         user_id = str(row["user_id"])
@@ -657,7 +748,7 @@ if __name__ == "__main__":
             detail_images=[],
             category_hint="Video_Games",
             user_id=user_id,
-            behavior="positive",
+            behavior=str(row["behavior"]),
             timestamp=timestamp,
         )
         history_meta_records.append(asdict(hist_item))
@@ -681,13 +772,22 @@ if __name__ == "__main__":
         profile["behavior"] = hist_item.behavior
         profile["timestamp"] = int(hist_item.timestamp)
         profile["user_id"] = hist_item.user_id
-        history_profiler.history_db.insert(
+        if not history_profiler.history_db.exists(
             user_id=hist_item.user_id,
             item_id=hist_item.item_id,
             behavior=hist_item.behavior,
             timestamp=hist_item.timestamp,
-            profile=profile,
-        )
+        ):
+            history_profiler.history_db.insert(
+                user_id=hist_item.user_id,
+                item_id=hist_item.item_id,
+                behavior=hist_item.behavior,
+                timestamp=hist_item.timestamp,
+                profile=profile,
+            )
+            history_write_status = "inserted"
+        else:
+            history_write_status = "already_exists"
         history_profile_records.append(
             {
                 "user_id": user_id,
@@ -695,14 +795,19 @@ if __name__ == "__main__":
                 "timestamp": timestamp,
                 "source": "history",
                 "profile_source": profile_source,
+                "history_write_status": history_write_status,
                 "profile": profile,
             }
         )
         print(
             f"\n[Agent 2][{idx}/{len(sampled_user_rows)}] "
-            f"user_id={user_id}, item_id={item_id}, ts={timestamp}"
+            f"user_id={user_id}, item_id={item_id}, ts={timestamp}, "
+            f"behavior={hist_item.behavior}, profile_source={profile_source}, "
+            f"history_write_status={history_write_status}"
         )
         print(json.dumps(profile, ensure_ascii=False, indent=2))
+        if idx % batch_size == 0:
+            print(f"[Agent 2] batch progress: {idx}/{len(sampled_user_rows)}")
 
     # Save meta and generated profiles for manual verification.
     _write_jsonl(run_out_dir / "candidate_meta.jsonl", candidate_meta_records)
@@ -721,4 +826,4 @@ if __name__ == "__main__":
         "user_history_profiles",
         run_out_dir / "user_history_profiles_snapshot.jsonl",
     )
-    print(f"\nSaved run artifacts to: {run_out_dir.resolve()}")
+    print(f"\nSaved/updated shared run artifacts in: {run_out_dir.resolve()}")

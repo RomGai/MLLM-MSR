@@ -83,7 +83,7 @@ history_profiler.profile_and_store(hist_item)
 直接执行 `python item_profiler_agents.py` 时，会：
 
 1. 从 `*_item_desc.tsv` 随机抽取最多 10 个不同商品 `item_id` 跑 Agent 1；
-2. 从 `*_u_i_pairs.tsv` 选择 1 个用户，并按时间戳升序对该用户完整交互序列进行 Agent 2 建模；
+2. 从 `*_user_items_negs.tsv` 读取正负标签，并与 `*_u_i_pairs.tsv` 的时间戳进行关联，选择 2 个用户分别按时间戳升序进行完整序列建模；
 3. 将两类 profile 写入本地 SQLite，并在终端打印每条 profile 的 JSON 结果。
 
 ## Qwen3-VL 官方式推理参数
@@ -108,7 +108,7 @@ history_profiler.profile_and_store(hist_item)
 
 ## 运行产物落盘（便于人工核验）
 
-每次运行 `__main__` 会在 `./processed/profiler_runs/<timestamp>/` 生成：
+`__main__` 统一复用目录 `./processed/profiler_runs/shared/`（不会每次新建目录），并增量更新如下文件：
 
 - `candidate_meta.jsonl`：Agent1 使用的候选商品 meta 输入
 - `history_meta.jsonl`：Agent2 使用的历史交互 meta 输入
@@ -118,3 +118,13 @@ history_profiler.profile_and_store(hist_item)
 - `user_history_profiles_snapshot.jsonl`：用户历史库快照
 
 - 若某个 history item 在全局商品库中已经建模（`global_item_features` 已存在该 `item_id`），会直接复用已建模 profile，不重复调用模型。
+
+
+- 为模拟大批量输入，支持按批次处理与进度打印（环境变量：`batch_size`），即使设置了读取上限条目数也按 batch 语义执行。
+- 为避免断点重跑导致重复建模：
+  - 候选/历史建模前先查 `global_item_features`，已存在则直接复用；
+  - 写入 `user_history_profiles` 前先检查 `(user_id,item_id,behavior,timestamp)`，已存在则跳过插入。
+- 关键环境变量补充：
+  - `candidate_sample_k`：候选热启动样本数（默认 10）
+  - `max_history_rows`：单用户历史最大序列长度（默认 500）
+  - `batch_size`：批处理进度粒度（默认 64）
