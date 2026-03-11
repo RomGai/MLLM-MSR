@@ -119,6 +119,18 @@ class Qwen3DynamicReasonerLLM:
                 }
             )
 
+        guardrail_block = (
+            "先决条件一致性（必须执行）：\n"
+            "A) 必须先判断用户当前意图所属的商品类型与关键先决条件，再输出偏好。\n"
+            "B) 任何与先决条件冲突的属性必须进入 Must_Avoid，且不得在 Must_Have/Nice_to_Have 中出现冲突项。\n"
+            "C) 若历史行为与当前query冲突，以当前query的先决条件优先，历史仅作为风格/预算/题材补充。\n"
+            "D) 禁止推荐跨平台或不兼容商品（例如 PC 游戏 vs PS/Xbox/Switch；iOS 配件 vs Android 专用）。\n"
+            "E) 对人群敏感类目必须检查目标人群先决条件（例如服饰的性别/年龄段/尺码体系，婴幼儿用品的月龄阶段）。\n"
+            "F) 对技术类商品必须检查兼容性先决条件（系统版本、接口/协议、功率/电压、尺寸规格）。\n"
+            "G) 若信息不足以确认兼容性，必须在 Must_Avoid 中明确“避免不兼容/平台不符”，并在 Reasoning 写明不确定点。\n"
+            "H) 输出前做一次一致性自检：Must_Have 与 Must_Avoid 不能互相矛盾，且所有 Must_Have 都必须满足先决条件。"
+        )
+
         clean_query = (query or "").strip()
         if clean_query:
             prompt = (
@@ -128,7 +140,9 @@ class Qwen3DynamicReasonerLLM:
                 "1) 明确区分 Must_Have / Nice_to_Have / Must_Avoid。\n"
                 "2) 若历史中存在可分析的视觉信息（如 visual_tags/图片衍生描述），Nice_to_Have 必须包含视觉偏好结论；若无可分析视觉信息，则不要引用或臆造不存在的视觉信息。\n"
                 "3) 必须结合 history 中 positive 与 negative 的对比证据。\n"
-                "4) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Reasoning(字符串)。\n\n"
+                "4) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
+                f"5) {guardrail_block}\n"
+                "6) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Reasoning(字符串)。\n\n"
                 f"当前Query: {clean_query}\n"
                 f"相关历史记录(JSON): {json.dumps(history_for_prompt, ensure_ascii=False)}"
             )
@@ -141,7 +155,9 @@ class Qwen3DynamicReasonerLLM:
                 "2) 明确区分 Must_Have / Nice_to_Have / Must_Avoid。\n"
                 "3) 若历史中存在可分析的视觉信息（如 visual_tags/图片衍生描述），Nice_to_Have 必须包含视觉偏好结论；若无可分析视觉信息，则不要引用或臆造不存在的视觉信息。\n"
                 "4) 必须结合 history 中 positive 与 negative 的对比证据。\n"
-                "5) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Reasoning(字符串)。\n\n"
+                "5) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
+                f"6) {guardrail_block}\n"
+                "7) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Reasoning(字符串)。\n\n"
                 f"相关历史记录(JSON): {json.dumps(history_for_prompt, ensure_ascii=False)}"
             )
 
