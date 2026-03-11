@@ -119,17 +119,31 @@ class Qwen3DynamicReasonerLLM:
                 }
             )
 
-        prompt = (
-            "你是电商推荐系统中的实时偏好建模专家（Agent4）。\n"
-            "任务：根据用户当前query与相关历史正负行为，推理用户此刻偏好。\n"
-            "要求：\n"
-            "1) 明确区分 Must_Have / Nice_to_Have / Must_Avoid。\n"
-            "2) Nice_to_Have 中必须包含视觉偏好相关结论（可同时包含其他软偏好）。\n"
-            "3) 必须结合 history 中 positive 与 negative 的对比证据。\n"
-            "4) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Reasoning(字符串)。\n\n"
-            f"当前Query: {query}\n"
-            f"相关历史记录(JSON): {json.dumps(history_for_prompt, ensure_ascii=False)}"
-        )
+        clean_query = (query or "").strip()
+        if clean_query:
+            prompt = (
+                "你是电商推荐系统中的实时偏好建模专家（Agent4）。\n"
+                "任务：根据用户当前query与相关历史正负行为，推理用户此刻偏好。\n"
+                "要求：\n"
+                "1) 明确区分 Must_Have / Nice_to_Have / Must_Avoid。\n"
+                "2) 若历史中存在可分析的视觉信息（如 visual_tags/图片衍生描述），Nice_to_Have 必须包含视觉偏好结论；若无可分析视觉信息，则不要引用或臆造不存在的视觉信息。\n"
+                "3) 必须结合 history 中 positive 与 negative 的对比证据。\n"
+                "4) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Reasoning(字符串)。\n\n"
+                f"当前Query: {clean_query}\n"
+                f"相关历史记录(JSON): {json.dumps(history_for_prompt, ensure_ascii=False)}"
+            )
+        else:
+            prompt = (
+                "你是电商推荐系统中的实时偏好建模专家（Agent4）。\n"
+                "任务：当前没有可用query。请仅根据用户相关历史正负行为，推理用户此刻偏好。\n"
+                "要求：\n"
+                "1) 不要假设额外query意图，不要引用不存在的query信息。\n"
+                "2) 明确区分 Must_Have / Nice_to_Have / Must_Avoid。\n"
+                "3) 若历史中存在可分析的视觉信息（如 visual_tags/图片衍生描述），Nice_to_Have 必须包含视觉偏好结论；若无可分析视觉信息，则不要引用或臆造不存在的视觉信息。\n"
+                "4) 必须结合 history 中 positive 与 negative 的对比证据。\n"
+                "5) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Reasoning(字符串)。\n\n"
+                f"相关历史记录(JSON): {json.dumps(history_for_prompt, ensure_ascii=False)}"
+            )
 
         messages = [{"role": "user", "content": prompt}]
         text = self._tokenizer.apply_chat_template(

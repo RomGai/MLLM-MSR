@@ -14,11 +14,14 @@
 - 对比历史正负样本中商品的 `taxonomy / text_tags / visual_tags`。
 - 推理当前会话下用户核心诉求，输出结构化偏好条件：
   - `Must_Have`
-  - `Nice_to_Have`（**必须包含视觉偏好结论**）
+  - `Nice_to_Have`（若有可分析视觉信息则必须包含视觉偏好结论；若无则不得臆造）
   - `Must_Avoid`
   - `Reasoning`
 
 LLM 调用方式与 Agent3 一致：`Qwen/Qwen3-8B + apply_chat_template(enable_thinking=True)`。
+
+补充：当 `query` 为空时，Agent4 会自动切换到“无 query 专用提示词”，
+仅基于相关历史正负行为推理偏好，避免因空 query 引导造成决策噪声。
 
 ## Agent 5：决策精排专家 (Ranking & Scoring Agent - LLM)
 
