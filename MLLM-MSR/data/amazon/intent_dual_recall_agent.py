@@ -570,7 +570,7 @@ if __name__ == "__main__":
 
     out = agent.run(
         user_id="0",
-        query="我想找适合客厅多人玩的体感游戏",
+        query="", #我想找适合客厅多人玩的体感游戏
         min_candidate_items=10,
         query_category_paths_k=2,
         history_category_paths_k=3,
