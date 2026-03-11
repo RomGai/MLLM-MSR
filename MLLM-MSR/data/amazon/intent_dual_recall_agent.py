@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -42,6 +42,24 @@ class IntentDualRecallOutput:
     routing: Dict[str, Any]
     candidate_items: List[Dict[str, Any]]
     query_relevant_history: List[Dict[str, Any]]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _sanitize_for_filename(value: str) -> str:
+    safe = [ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(value)]
+    return "".join(safe).strip("_") or "unknown"
+
+
+def _build_output_file_path(
+    user_id: str,
+    query: str,
+    output_dir: str | Path = "./processed/intent_dual_recall_outputs",
+) -> Path:
+    query_tag = _sanitize_for_filename((query or "no_query")[:40])
+    filename = f"user_{_sanitize_for_filename(user_id)}_{query_tag}_intent_dual_recall_output.json"
+    return Path(output_dir) / filename
 
 
 class Qwen3RouterLLM:
@@ -370,6 +388,7 @@ class GlobalHistoryAccessor:
         user_id: str,
         lookback: int = 200,
         min_positive_first: bool = True,
+        top_category_paths_k: int = 3,
         top_item_types_k: int = 3,
     ) -> RoutingResult:
         """Infer category intent from user history when query is empty.
@@ -418,7 +437,9 @@ class GlobalHistoryAccessor:
             if item_type:
                 type_cnt[item_type] = type_cnt.get(item_type, 0) + 1
 
-        top_cats = sorted(cat_cnt.items(), key=lambda x: (-x[1], x[0]))[:3]
+        top_cats = sorted(cat_cnt.items(), key=lambda x: (-x[1], x[0]))[
+            : max(1, int(top_category_paths_k))
+        ]
         top_types = sorted(type_cnt.items(), key=lambda x: (-x[1], x[0]))[: max(1, int(top_item_types_k))]
         paths = [[seg.strip() for seg in cat.split(">") if seg.strip()] for cat, _ in top_cats]
         item_types = [t for t, _ in top_types]
@@ -449,7 +470,11 @@ class RoutingRecallAgent:
         min_candidate_items: int = 20,
         max_candidate_items: int = 200,
         max_history_rows: int = 200,
+        history_category_paths_k: int = 3,
+        query_category_paths_k: int = 3,
         interested_item_types_k: int = 3,
+        save_output: bool = True,
+        output_dir: str | Path = "./processed/intent_dual_recall_outputs",
     ) -> IntentDualRecallOutput:
         clean_query = (query or "").strip()
         category_catalog, item_type_catalog = self.accessor.category_catalog()
@@ -458,8 +483,12 @@ class RoutingRecallAgent:
         else:
             routing = self.accessor.infer_user_intent_from_history(
                 user_id=user_id,
+                top_category_paths_k=history_category_paths_k,
                 top_item_types_k=interested_item_types_k,
             )
+
+        if clean_query:
+            routing.category_paths = routing.category_paths[: max(1, int(query_category_paths_k))]
 
         history_top_item_types = self.accessor._top_item_types_from_history(
             user_id=user_id,
@@ -495,13 +524,15 @@ class RoutingRecallAgent:
                 max_rows=max_history_rows,
             )
 
-        return IntentDualRecallOutput(
+        output = IntentDualRecallOutput(
             query=clean_query,
             user_id=str(user_id),
             routing={
                 "reasoning": routing.reasoning,
                 "selected_category_paths": routing.category_paths,
                 "selected_item_types": routing.item_types,
+                "history_category_paths_k": max(1, int(history_category_paths_k)),
+                "query_category_paths_k": max(1, int(query_category_paths_k)),
                 "interested_item_types_k": max(1, int(interested_item_types_k)),
                 "history_top_item_types": history_top_item_types,
                 "final_rollup_paths": final_rollup_paths,
@@ -513,6 +544,17 @@ class RoutingRecallAgent:
             candidate_items=candidate_items,
             query_relevant_history=history_rows,
         )
+
+        if save_output:
+            path = _build_output_file_path(str(user_id), clean_query, output_dir=output_dir)
+            output.routing["saved_output_path"] = str(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(output.to_dict(), ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+        return output
 
 
 if __name__ == "__main__":
@@ -526,5 +568,13 @@ if __name__ == "__main__":
     )
     agent = RoutingRecallAgent(llm=llm, accessor=accessor)
 
-    out = agent.run(user_id="0", query="我想找适合客厅多人玩的体感游戏", min_candidate_items=10)
-    print(json.dumps(out.__dict__, ensure_ascii=False, indent=2, default=str))
+    out = agent.run(
+        user_id="0",
+        query="我想找适合客厅多人玩的体感游戏",
+        min_candidate_items=10,
+        query_category_paths_k=2,
+        history_category_paths_k=3,
+        save_output=True,
+        output_dir="./processed/intent_dual_recall_outputs",
+    )
+    print(json.dumps(out.to_dict(), ensure_ascii=False, indent=2, default=str))
