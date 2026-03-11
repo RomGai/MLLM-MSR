@@ -1,272 +1,207 @@
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
-import torch
-import cv2
-import os
-import shutil
-import tempfile
-from collections import defaultdict
-from typing import List, Dict, Iterable, Optional
-from peft import PeftModel
-from time_utils import timestamp_label
+"""LLM-based item reranker for Amazon recommendation (Qwen3-8B).
 
-adapter_dir = "./result" 
+This file implements Agent 5 compatible scoring:
+- 5-level relevance buckets (1~5)
+- logits-based weighted expectation score
 
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen2.5-VL-3B-Instruct", torch_dtype="auto", device_map="auto"
-)
-model = PeftModel.from_pretrained(model, adapter_dir)
-model = model.merge_and_unload()
-model.eval()
+Compared with previous multimodal reranker, this version is pure text LLM,
+using product structured profile from module-1 and dynamic constraints from module-3.
+"""
 
-processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+from __future__ import annotations
 
-_tokenizer = processor.tokenizer
-id_1 = _tokenizer.convert_tokens_to_ids("1")
-id_2 = _tokenizer.convert_tokens_to_ids("2")
-id_3 = _tokenizer.convert_tokens_to_ids("3")
-id_4 = _tokenizer.convert_tokens_to_ids("4")
-id_5 = _tokenizer.convert_tokens_to_ids("5")
+import json
+from typing import Any, Dict, List, Optional
+
+try:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except Exception:  # pragma: no cover
+    torch = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
 
 
-@torch.no_grad()
-def compute_logits(inputs, **kwargs):
-    batch_scores = model(**inputs).logits[:, -1, :]
-    id1_vector = batch_scores[:, id_1]
-    id2_vector = batch_scores[:, id_2]
-    id3_vector = batch_scores[:, id_3]
-    id4_vector = batch_scores[:, id_4]
-    id5_vector = batch_scores[:, id_5]
-    batch_scores = torch.stack([id1_vector, id2_vector, id3_vector, id4_vector, id5_vector], dim=1)
-    batch_scores = torch.nn.functional.log_softmax(batch_scores, dim=1)
-    scores = batch_scores.exp().tolist()
-    return scores
+class LLMItemReranker:
+    """Rerank candidate items with Qwen3-8B via five-level logits weighting."""
 
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-8B",
+        max_new_tokens: int = 8,
+        enable_thinking: bool = False,
+    ) -> None:
+        self.model_name = model_name
+        self.max_new_tokens = max_new_tokens
+        self.enable_thinking = enable_thinking
+        self._tokenizer = None
+        self._model = None
 
-def format_message(query, image_path):
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image_path},
-                {
-                    "type": "text",
-                    "text": (
-                        "Given the image, which is a frame from a video, rate how relevant this frame is for "
-                        f"answering the question: '{query}'.\n"
-                        "Output only one number from 1 to 5, where:\n"
-                        "1 = completely irrelevant — the frame provides no visual or contextual information related to the "
-                        "question or its answer.\n"
-                        "2 = slightly relevant — the frame shows general background or context, but it is unlikely to "
-                        "contribute to answering.\n"
-                        "3 = moderately relevant — the frame includes partial clues or indirect context that might help "
-                        "infer the answer, but the key evidence is missing.\n"
-                        "4 = mostly relevant — the frame provides substantial visual or contextual information that can be "
-                        "used to answer the question, though not fully decisive.\n"
-                        "5 = highly relevant — the frame clearly contains the decisive evidence or strong contextual cues "
-                        "that directly or indirectly support the correct answer."
-                    ),
-                },
-            ],
-        }
-    ]
+        self.id_1 = None
+        self.id_2 = None
+        self.id_3 = None
+        self.id_4 = None
+        self.id_5 = None
 
+    def load(self) -> None:
+        if AutoTokenizer is None or AutoModelForCausalLM is None or torch is None:
+            raise ImportError("transformers/torch are not available for LLMItemReranker.")
+        if self._model is not None and self._tokenizer is not None:
+            return
 
-def _score_segment_frames(
-    segment_info: Dict,
-    query: str,
-    frame_interval: int,
-    temp_dir: str,
-    *,
-    target_sample_fps: Optional[float] = None,
-) -> List[Dict]:
-    os.makedirs(temp_dir, exist_ok=True)
-    video_path = segment_info["path"]
-    cap = cv2.VideoCapture(video_path)
-    fps = float(cap.get(cv2.CAP_PROP_FPS)) or float(segment_info.get("fps", 0) or 0.0)
-    if fps <= 0.0:
-        fps = 1.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Video loaded: {video_path} | {total_frames} frames at {fps} FPS")
-
-    frame_results: List[Dict] = []
-
-    idx = 0
-    success, frame = cap.read()
-    effective_interval = max(int(frame_interval), 1)
-    if target_sample_fps and target_sample_fps > 0.0 and fps > 0.0:
-        computed = int(round(fps / float(target_sample_fps)))
-        effective_interval = max(computed, 1)
-    while success:
-        if idx % effective_interval == 0:
-            segment_index = segment_info.get("segment_index")
-            if segment_index is not None:
-                segment_index = int(segment_index)
-            else:
-                segment_index = 0
-
-            frame_filename = f"seg{segment_index:04d}_frame_{idx:05d}.jpg"
-            frame_path = os.path.join(temp_dir, frame_filename)
-            cv2.imwrite(frame_path, frame)
-
-            messages = format_message(query, frame_path)
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, video_inputs = process_vision_info(messages)
-            inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to("cuda")
-
-            probs = compute_logits(inputs)[0]
-            weighted_sum = sum((i + 1) * p for i, p in enumerate(probs))
-
-            start_frame = segment_info.get("start_frame", 0)
-            if start_frame is None:
-                start_frame = 0
-            global_frame_index = int(start_frame) + idx
-            timestamp = global_frame_index / fps if fps else 0.0
-
-            frame_results.append(
-                {
-                    "temp_path": frame_path,
-                    "score": weighted_sum,
-                    "segment_index": segment_index,
-                    "segment_path": video_path,
-                    "frame_in_segment": idx,
-                    "global_frame_index": global_frame_index,
-                    "timestamp": timestamp,
-                }
-            )
-
-        success, frame = cap.read()
-        idx += 1
-
-    cap.release()
-    print(f"Extracted {len(frame_results)} frames for scoring")
-
-    return frame_results
-
-
-def rerank_segments(
-    segment_infos: Iterable[Dict],
-    query: str,
-    frame_interval: int = 10,
-    top_frames: int = 128,
-    output_dir: str = "reranker_output",
-    min_frames_per_clip: int = 6,
-    *,
-    target_sample_fps: Optional[float] = None,
-) -> List[Dict]:
-    """Score retrieved segments at the frame level, re-rank them, and export the most relevant frames.
-    
-    Before global ranking, the top-scoring ``min_frames_per_clip`` frames from each segment are kept
-    to avoid entirely filtering out segments that score well overall.
-    """
-
-    temp_dir = tempfile.mkdtemp(prefix="frames_tmp_")
-    os.makedirs(output_dir, exist_ok=True)
-
-    try:
-        all_frames: List[Dict] = []
-        for info in segment_infos:
-            all_frames.extend(
-                _score_segment_frames(
-                    info,
-                    query=query,
-                    frame_interval=frame_interval,
-                    temp_dir=temp_dir,
-                    target_sample_fps=target_sample_fps,
-                )
-            )
-
-        if not all_frames:
-            return []
-
-        if top_frames <= 0:
-            return []
-
-        grouped_frames: Dict[int, List[Dict]] = defaultdict(list)
-        for frame_info in all_frames:
-            grouped_frames[int(frame_info["segment_index"])].append(frame_info)
-
-        for frame_list in grouped_frames.values():
-            frame_list.sort(key=lambda x: x["score"], reverse=True)
-
-        initial_selection: List[Dict] = []
-        if min_frames_per_clip > 0:
-            for frame_list in grouped_frames.values():
-                initial_selection.extend(frame_list[:min_frames_per_clip])
-
-        initial_selection.sort(key=lambda x: x["score"], reverse=True)
-        if len(initial_selection) > top_frames:
-            selected_frames = initial_selection[:top_frames]
-        else:
-            selected_frames = list(initial_selection)
-            remaining_frames: List[Dict] = []
-            for frame_list in grouped_frames.values():
-                start_idx = min_frames_per_clip if min_frames_per_clip > 0 else 0
-                remaining_frames.extend(frame_list[start_idx:])
-
-            remaining_frames.sort(key=lambda x: x["score"], reverse=True)
-            for frame_info in remaining_frames:
-                if len(selected_frames) >= top_frames:
-                    break
-                selected_frames.append(frame_info)
-
-        selected_frames = selected_frames[:top_frames]
-        selected_frames.sort(
-            key=lambda x: (x["timestamp"], x["segment_index"], x["frame_in_segment"])
+        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self._model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype="auto",
+            device_map="auto",
         )
 
-        results: List[Dict] = []
-        for rank, frame_info in enumerate(selected_frames, start=1):
-            timestamp = float(frame_info.get("timestamp") or 0.0)
-            timestamp_tag = timestamp_label(timestamp)
-            filename = (
-                f"t{timestamp_tag}_"
-                f"seg{frame_info['segment_index']:04d}_"
-                f"frame{frame_info['frame_in_segment']:05d}.jpg"
-            )
-            dest_path = os.path.join(output_dir, filename)
-            shutil.copy2(frame_info["temp_path"], dest_path)
+        self.id_1 = self._tokenizer.convert_tokens_to_ids("1")
+        self.id_2 = self._tokenizer.convert_tokens_to_ids("2")
+        self.id_3 = self._tokenizer.convert_tokens_to_ids("3")
+        self.id_4 = self._tokenizer.convert_tokens_to_ids("4")
+        self.id_5 = self._tokenizer.convert_tokens_to_ids("5")
 
-            enriched = dict(frame_info)
-            enriched["rank"] = rank
-            enriched["output_path"] = dest_path
-            enriched["timestamp_label"] = timestamp_tag
-            results.append(enriched)
+    @torch.no_grad()
+    def _score_with_logits(self, prompt: str) -> Dict[str, Any]:
+        self.load()
+        messages = [{"role": "user", "content": prompt}]
+        text = self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=self.enable_thinking,
+        )
+        inputs = self._tokenizer([text], return_tensors="pt").to(self._model.device)
+        logits = self._model(**inputs).logits[:, -1, :]
 
-        return results
+        score_logits = torch.stack(
+            [
+                logits[:, self.id_1],
+                logits[:, self.id_2],
+                logits[:, self.id_3],
+                logits[:, self.id_4],
+                logits[:, self.id_5],
+            ],
+            dim=1,
+        )
+        probs = torch.nn.functional.softmax(score_logits, dim=1)[0]
+        p = probs.tolist()
+        weighted = sum((idx + 1) * val for idx, val in enumerate(p))
 
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        return {
+            "probs": {"1": p[0], "2": p[1], "3": p[2], "4": p[3], "5": p[4]},
+            "weighted_score": float(weighted),
+        }
+
+    @staticmethod
+    def _build_scoring_prompt(
+        query: str,
+        preference_constraints: Dict[str, Any],
+        item: Dict[str, Any],
+    ) -> str:
+        must_have = preference_constraints.get("Must_Have", [])
+        nice_to_have = preference_constraints.get("Nice_to_Have", [])
+        must_avoid = preference_constraints.get("Must_Avoid", [])
+
+        profile = item.get("profile", {})
+        compact_item = {
+            "item_id": item.get("item_id"),
+            "title": profile.get("title", ""),
+            "taxonomy": profile.get("taxonomy", {}),
+            "text_tags": profile.get("text_tags", {}),
+            "visual_tags": profile.get("visual_tags", {}),
+            "hypotheses": profile.get("hypotheses", []),
+            "overall_confidence": profile.get("overall_confidence", 0.0),
+        }
+
+        return (
+            "你是电商推荐精排专家（Agent5）。请从用户视角判断候选商品与当下偏好的匹配程度。\n"
+            "评分规则（只能取1~5）：\n"
+            "1=触碰Must_Avoid或与核心诉求明显冲突；\n"
+            "2=弱相关，仅少量满足；\n"
+            "3=中等相关，满足部分Must_Have或多个Nice_to_Have；\n"
+            "4=高相关，满足大多数Must_Have且有Nice_to_Have加分；\n"
+            "5=强匹配，完整满足Must_Have且无冲突，同时在Nice_to_Have表现突出。\n"
+            "请只输出一个数字：1/2/3/4/5。\n\n"
+            f"用户Query: {query}\n"
+            f"Must_Have: {json.dumps(must_have, ensure_ascii=False)}\n"
+            f"Nice_to_Have: {json.dumps(nice_to_have, ensure_ascii=False)}\n"
+            f"Must_Avoid: {json.dumps(must_avoid, ensure_ascii=False)}\n"
+            f"候选商品画像: {json.dumps(compact_item, ensure_ascii=False)}\n"
+        )
+
+    @staticmethod
+    def _must_avoid_filter(preference_constraints: Dict[str, Any], item: Dict[str, Any]) -> bool:
+        must_avoid = [str(x).strip().lower() for x in preference_constraints.get("Must_Avoid", []) if str(x).strip()]
+        if not must_avoid:
+            return False
+
+        profile = item.get("profile", {})
+        haystacks = [
+            profile.get("title", ""),
+            json.dumps(profile.get("taxonomy", {}), ensure_ascii=False),
+            json.dumps(profile.get("text_tags", {}), ensure_ascii=False),
+            json.dumps(profile.get("visual_tags", {}), ensure_ascii=False),
+            json.dumps(profile.get("hypotheses", []), ensure_ascii=False),
+        ]
+        item_text = "\n".join(str(x) for x in haystacks).lower()
+        return any(token and token in item_text for token in must_avoid)
+
+    def rerank_items(
+        self,
+        query: str,
+        preference_constraints: Dict[str, Any],
+        candidate_items: List[Dict[str, Any]],
+        top_n: int = 20,
+    ) -> List[Dict[str, Any]]:
+        self.load()
+        if top_n <= 0:
+            return []
+
+        scored: List[Dict[str, Any]] = []
+        for item in candidate_items:
+            if self._must_avoid_filter(preference_constraints, item):
+                continue
+
+            prompt = self._build_scoring_prompt(query, preference_constraints, item)
+            score_info = self._score_with_logits(prompt)
+            enriched = dict(item)
+            enriched["ranking_score"] = score_info["weighted_score"]
+            enriched["score_probs"] = score_info["probs"]
+            scored.append(enriched)
+
+        scored.sort(
+            key=lambda x: (
+                float(x.get("ranking_score", 0.0)),
+                float((x.get("score_probs") or {}).get("5", 0.0)),
+            ),
+            reverse=True,
+        )
+
+        final_items: List[Dict[str, Any]] = []
+        for rank, row in enumerate(scored[:top_n], start=1):
+            row["rank"] = rank
+            final_items.append(row)
+        return final_items
 
 
 if __name__ == "__main__":
     import argparse
-    import json
+    from pathlib import Path
 
-    parser = argparse.ArgumentParser(description="Rerank frames for selected segments")
-    parser.add_argument("segments", help="JSON file with segment infos")
-    parser.add_argument("query", help="Text query")
-    parser.add_argument("--frame-interval", type=int, default=10, dest="frame_interval")
-    parser.add_argument("--top-frames", type=int, default=128, dest="top_frames")
-    parser.add_argument("--output", default="reranker_output")
-
+    parser = argparse.ArgumentParser(description="LLM rerank candidate items from module-3 payload")
+    parser.add_argument("input_json", help="JSON containing query/preference_constraints/candidate_items")
+    parser.add_argument("--top-n", type=int, default=20)
+    parser.add_argument("--model", default="Qwen/Qwen3-8B")
     args = parser.parse_args()
 
-    with open(args.segments, "r", encoding="utf-8") as f:
-        infos = json.load(f)
-
-    results = rerank_segments(
-        infos,
-        query=args.query,
-        frame_interval=args.frame_interval,
-        top_frames=args.top_frames,
-        output_dir=args.output,
+    payload = json.loads(Path(args.input_json).read_text(encoding="utf-8"))
+    reranker = LLMItemReranker(model_name=args.model)
+    results = reranker.rerank_items(
+        query=str(payload.get("query", "")),
+        preference_constraints=dict(payload.get("preference_constraints", {})),
+        candidate_items=list(payload.get("candidate_items", [])),
+        top_n=args.top_n,
     )
-
-    print(json.dumps(results, ensure_ascii=False, indent=2))
+    print(json.dumps(results, ensure_ascii=False, indent=2, default=str))
