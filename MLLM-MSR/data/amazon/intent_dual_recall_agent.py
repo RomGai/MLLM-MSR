@@ -354,6 +354,24 @@ class GlobalHistoryAccessor:
             )
         return results
 
+    def user_seen_item_ids(
+        self,
+        user_id: str,
+        lookback: int = 5000,
+    ) -> set[str]:
+        """Return deduplicated item_ids from the user's full raw history sequence."""
+        rows = self.history_conn.execute(
+            """
+            SELECT item_id
+            FROM user_history_profiles
+            WHERE user_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (str(user_id), int(lookback)),
+        ).fetchall()
+        return {str(r["item_id"]) for r in rows if str(r["item_id"]).strip()}
+
     def _top_item_types_from_history(
         self,
         user_id: str,
@@ -473,6 +491,8 @@ class RoutingRecallAgent:
         history_category_paths_k: int = 3,
         query_category_paths_k: int = 3,
         interested_item_types_k: int = 3,
+        exclude_seen_items: bool = True,
+        seen_history_lookback: int = 5000,
         save_output: bool = True,
         output_dir: str | Path = "./processed/intent_dual_recall_outputs",
     ) -> IntentDualRecallOutput:
@@ -524,6 +544,17 @@ class RoutingRecallAgent:
                 max_rows=max_history_rows,
             )
 
+        seen_item_ids: set[str] = set()
+        if exclude_seen_items:
+            seen_item_ids = self.accessor.user_seen_item_ids(
+                user_id=user_id,
+                lookback=seen_history_lookback,
+            )
+            if seen_item_ids:
+                candidate_items = [
+                    x for x in candidate_items if str(x.get("item_id", "")) not in seen_item_ids
+                ]
+
         output = IntentDualRecallOutput(
             query=clean_query,
             user_id=str(user_id),
@@ -535,6 +566,9 @@ class RoutingRecallAgent:
                 "query_category_paths_k": max(1, int(query_category_paths_k)),
                 "interested_item_types_k": max(1, int(interested_item_types_k)),
                 "history_top_item_types": history_top_item_types,
+                "exclude_seen_items": bool(exclude_seen_items),
+                "seen_history_lookback": int(seen_history_lookback),
+                "seen_item_count": len(seen_item_ids),
                 "final_rollup_paths": final_rollup_paths,
                 "catalog_size": {
                     "category_paths": len(category_catalog),
