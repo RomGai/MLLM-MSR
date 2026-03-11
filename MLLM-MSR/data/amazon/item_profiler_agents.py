@@ -705,8 +705,8 @@ if __name__ == "__main__":
     # - warm up candidate item profiles with batched runs
     # - pick two users and run full labeled history sequence modeling by timestamp order
     # - run both profilers and print profile outputs
-    sample_k = int(os.getenv("candidate_sample_k", "5"))
-    batch_size = int(os.getenv("batch_size", "64"))
+    sample_k = int(os.getenv("candidate_sample_k", "20"))
+    batch_size = int(os.getenv("batch_size", "4"))
     max_history_rows = int(os.getenv("max_history_rows", "500"))
     item_desc_tsv_path = "./processed/Video_Games_item_desc.tsv"
     user_pairs_tsv_path = "./processed/Video_Games_u_i_pairs.tsv"
