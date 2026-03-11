@@ -54,6 +54,15 @@
 - 若召回量 `< min_candidate_items`，对每条层级路径做“去掉最后一级”的上卷。
 - 重复上卷直至数量满足或无法继续。
 
+
+#### 路 A 去重策略（新增）
+- 默认开启 `exclude_seen_items=True`：
+  - 会基于用户在 `user_history_profiles` 中的**原始全历史序列**（不依赖路 B 的相关性过滤）构建 `seen_item_ids`；
+  - 从路 A 候选集中剔除这些已交互 `item_id`，避免把“看过/点过/负反馈过”的旧商品再次推给用户。
+- 可通过参数控制：
+  - `exclude_seen_items`：是否开启历史去重（默认 `True`）
+  - `seen_history_lookback`：构建 `seen_item_ids` 时最多读取多少历史条目（默认 `5000`）
+
 #### 路 B：用户历史精准召回
 - 在 `user_history_profiles` 中按 `user_id` 拉取最近记录。
 - 使用与路 A 相同的类目/类型匹配逻辑过滤。
