@@ -14,7 +14,7 @@
 - 对比历史正负样本中商品的 `taxonomy / text_tags / visual_tags`。
 - 推理当前会话下用户核心诉求，输出结构化偏好条件：
   - `Must_Have`
-  - `Nice_to_Have`（**必须包含视觉偏好结论**）
+  - `Nice_to_Have`（若有可分析视觉信息则必须包含视觉偏好结论；若无则不得臆造）
   - `Must_Avoid`
   - `Reasoning`
 
