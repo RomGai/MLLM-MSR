@@ -275,6 +275,73 @@ def _collect_group_scores(
     return labels, scores
 
 
+def _write_eval21_scored_items(
+    out_path: str | Path,
+    user_id: str,
+    eval21_items: Sequence[str],
+    selected_positive: str,
+    item_map: Dict[str, Dict[str, str]],
+    ranked_items: Sequence[Dict[str, object]],
+    labels: Sequence[int],
+    scores: Sequence[float],
+) -> None:
+    ranked_map: Dict[str, Dict[str, object]] = {}
+    for rank, x in enumerate(ranked_items, start=1):
+        iid = str(x.get("item_id", "")).strip()
+        if not iid or iid in ranked_map:
+            continue
+        ranked_map[iid] = {
+            "ranking_score": float(x.get("ranking_score", 0.0)),
+            "rank_in_ranked_items": rank,
+        }
+
+    records = []
+    for iid, label, score in zip(eval21_items, labels, scores):
+        base = item_map.get(iid, {})
+        ranked_meta = ranked_map.get(iid)
+        records.append(
+            {
+                "user_id": str(user_id),
+                "item_id": iid,
+                "sample_type": "pos" if int(label) == 1 else "neg",
+                "label": int(label),
+                "score_for_metrics": float(score),
+                "in_ranked_items": bool(ranked_meta is not None),
+                "rank_in_ranked_items": int(ranked_meta["rank_in_ranked_items"]) if ranked_meta else None,
+                "raw_ranking_score": float(ranked_meta["ranking_score"]) if ranked_meta else None,
+                "image": str(base.get("image", "")),
+                "summary": str(base.get("summary", "")),
+                "is_selected_positive": iid == selected_positive,
+            }
+        )
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    tsv_path = out.with_suffix(".tsv")
+    with tsv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "user_id",
+                "item_id",
+                "sample_type",
+                "label",
+                "score_for_metrics",
+                "in_ranked_items",
+                "rank_in_ranked_items",
+                "raw_ranking_score",
+                "image",
+                "summary",
+                "is_selected_positive",
+            ],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerows(records)
+
+
 def _pick_units(units: List[EvalUnit], target_user_id: str, target_user_row_index: int, max_users: int) -> List[EvalUnit]:
     if target_user_id:
         user_units = [u for u in units if u.user_id == target_user_id]
@@ -479,6 +546,16 @@ def main(args: argparse.Namespace) -> None:
         ranked_items = list(payload.get("ranked_items", []))
 
         labels, scores = _collect_group_scores(eval21_items, selected_positive, ranked_items)
+        _write_eval21_scored_items(
+            out_path=user_dir / "eval21_scored_items.json",
+            user_id=unit.user_id,
+            eval21_items=eval21_items,
+            selected_positive=selected_positive,
+            item_map=item_map,
+            ranked_items=ranked_items,
+            labels=labels,
+            scores=scores,
+        )
         grouped_labels.append(labels)
         grouped_scores.append(scores)
 
