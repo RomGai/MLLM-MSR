@@ -50,8 +50,6 @@ def _collect_all_labeled_history_rows(
     for row in expand_pos_neg_rows(user_items_negs_path):
         user_id = str(row["user_id"])
         item_id = str(row["item_id"])
-        if user_id not in processed_user_ids:
-            processed_user_ids.add(user_id)
         behavior = str(row["behavior"])
         ts = ts_map.get((user_id, item_id))
 
@@ -200,6 +198,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
 
     for row_idx, row in enumerate(all_history_rows, start=1):
         user_id = str(row["user_id"])
+        processed_user_ids.add(user_id)
         item_id = str(row["item_id"])
         timestamp_raw = row.get("timestamp")
         timestamp: Optional[int] = None if timestamp_raw is None else int(timestamp_raw)
