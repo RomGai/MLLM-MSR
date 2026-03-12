@@ -112,3 +112,56 @@ result = agent.run(
 print(result.candidate_items[:3])
 print(result.query_relevant_history[:3])
 ```
+
+## 6. 与 `test/microlens/test_with_llava.py` 的评测口径对齐建议
+
+`test_with_llava.py` 在计算排序指标前，会将预测分数 reshape 为 `(-1, 21)`，即默认每个评测单元固定是 21 个候选样本（通常是 1 个正样本 + 20 个负样本）。
+
+因此若你希望 `run_full_agents_pipeline.py` 的产出与该评测方式做**条件一致**对齐，推荐按以下口径：
+
+1. **用户历史建模保持完整**：
+   - Agent 2 仍然读取用户历史并写入 `user_history_profiles`；
+   - Agent 4 的偏好推理继续基于完整历史（或 query 相关历史）进行，不要把历史截断成 21 条。
+2. **候选评测池限制为 21 个样本**：
+   - 在评测阶段，为每个用户/样本单元提供固定 21 个待排候选；
+   - Agent 3/5 的召回与重排应当只在这 21 个候选里进行，以保证与 `reshape(-1, 21)` 的指标定义一致。
+3. **指标按组计算**：
+   - 最终按每组 21 个候选计算 Recall@K / MRR@K / NDCG@K，避免与“全库召回”场景混算。
+
+简言之：
+> 对齐 `test_with_llava.py` 时，应该“**候选库受限（21）** + **历史建模照常** + **在受限候选上做召回/重排并计算分组指标**”。
+
+## 7. 直接可用脚本：先构造 Agent1 的 21 样本全量商品库，再跑全流程
+
+新增脚本：`run_full_agents_pipeline_eval21.py`
+
+特点：
+- 在 Agent 1 之前，先构造 1 正 + 20 负的 21-item 商品库（并把这 21 个 item 当作 Agent 1 的全量商品输入）。
+- Agent 2 仍使用原始全量历史输入文件，不做 21 截断。
+- 构造出的 21-item 库会输出为 `--prepared-item-desc-out`，并记录元信息到 `--eval-unit-meta-out`。
+
+示例：
+
+```bash
+python run_full_agents_pipeline_eval21.py \
+  --item-desc-tsv ./processed/Video_Games_item_desc.tsv \
+  --user-pairs-tsv ./processed/Video_Games_u_i_pairs.tsv \
+  --eval-user-items-negs-tsv ./processed/Video_Games_user_items_negs_test.csv \
+  --agent2-user-items-negs-tsv ./processed/Video_Games_user_items_negs.tsv \
+  --target-user-id 23 \
+  --positive-index 0 \
+  --exclude-seen-for-negatives \
+  --bundle-output ./processed/full_pipeline_eval21_bundle.zip
+```
+
+说明：
+- `--eval-user-items-negs-tsv` 用于挑选“评测单元”（用户 + 正样本 + 负样本来源）。
+- 若该文件负样本不足 20，脚本会从全商品池中按随机种子补齐到 20（可选排除该用户历史看过商品）。
+- 最终确保 Agent 1 的商品输入恰好 21 个 item。
+- 脚本按用户循环处理；每处理完一个 user 会实时打印当前累计指标（AUC / Recall@K / MRR@K / NDCG@K），指标公式与 `test_with_llava.py` 保持一致的分组口径。
+
+
+补充（共享商品库复用）：
+- 可通过 `--shared-global-db-path` 指定一个共享的商品库 DB（`global_item_features.db`），所有 user 复用同一库。
+- 可通过 `--shared-history-db-path` 指定共享历史库，避免重复写入历史画像。
+- 可通过 `--agent2-item-desc-tsv` 为 Agent2 提供完整商品元数据回退源；当当前 21-item 输入中不存在某个历史 item 时，Agent2 会从该文件取 `image/summary`，并在全局商品库缺失时按 Agent1 逻辑补建该 item 的画像。
