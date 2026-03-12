@@ -59,6 +59,33 @@ def _read_user_items_negs(path: str | Path) -> List[EvalUnit]:
     return rows
 
 
+def _write_user_items_negs_for_single_user(
+    rows: Sequence[EvalUnit],
+    user_id: str,
+    out_path: str | Path,
+) -> int:
+    """Write all pos/neg rows for one user to a temp Agent2 input TSV."""
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    selected = [r for r in rows if r.user_id == str(user_id)]
+    if not selected:
+        raise ValueError(f"No rows found for user_id={user_id} in Agent2 user-items-negs input")
+
+    with out.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["user_id", "pos", "neg"], delimiter="\t")
+        writer.writeheader()
+        for r in selected:
+            writer.writerow(
+                {
+                    "user_id": r.user_id,
+                    "pos": ",".join(r.pos_items),
+                    "neg": ",".join(r.neg_items),
+                }
+            )
+    return len(selected)
+
+
 def _read_item_desc_rows(path: str | Path) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     with Path(path).open("r", encoding="utf-8") as f:
@@ -301,6 +328,11 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Optional shared global_item_features.db path reused across all users",
     )
     parser.add_argument(
+        "--global-db-path",
+        default="",
+        help="Alias of --shared-global-db-path for passing one reusable global DB path",
+    )
+    parser.add_argument(
         "--shared-history-db-path",
         default="",
         help="Optional shared user_history_log.db path reused across all users",
@@ -334,11 +366,15 @@ def main(args: argparse.Namespace) -> None:
         raise ValueError("No valid eval rows")
     units = _pick_units(units_all, str(args.target_user_id), int(args.target_user_row_index), int(args.max_users))
 
+    agent2_units_all = _read_user_items_negs(args.agent2_user_items_negs_tsv)
+    if not agent2_units_all:
+        raise ValueError("No valid rows in agent2-user-items-negs-tsv")
+
     root = Path(args.eval_run_root)
     root.mkdir(parents=True, exist_ok=True)
 
     agent2_item_desc_tsv = str(args.agent2_item_desc_tsv or args.item_desc_tsv)
-    shared_global_db_path = str(args.shared_global_db_path or "").strip()
+    shared_global_db_path = str(args.shared_global_db_path or args.global_db_path or "").strip()
     shared_history_db_path = str(args.shared_history_db_path or "").strip()
     if shared_global_db_path:
         Path(shared_global_db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -379,11 +415,20 @@ def main(args: argparse.Namespace) -> None:
         prepared_item_desc = user_dir / "eval21_item_desc.tsv"
         _write_filtered_item_desc(item_rows, set(eval21_items), prepared_item_desc)
 
+        per_user_agent2_user_items_negs = user_dir / "agent2_user_items_negs.tsv"
+        selected_rows = _write_user_items_negs_for_single_user(
+            rows=agent2_units_all,
+            user_id=unit.user_id,
+            out_path=per_user_agent2_user_items_negs,
+        )
+
         meta = {
             "user_id": unit.user_id,
             "selected_positive_item": selected_positive,
             "eval21_items": eval21_items,
             "selected_group_size": len(eval21_items),
+            "agent2_user_items_negs_rows": selected_rows,
+            "agent2_user_items_negs_tsv": str(per_user_agent2_user_items_negs),
             "global_db_path": shared_global_db_path or str(user_dir / "global_item_features.db"),
             "history_db_path": shared_history_db_path or str(user_dir / "user_history_log.db"),
         }
@@ -396,7 +441,7 @@ def main(args: argparse.Namespace) -> None:
         run_args = SimpleNamespace(
             item_desc_tsv=str(prepared_item_desc),
             user_pairs_tsv=str(args.user_pairs_tsv),
-            user_items_negs_tsv=str(args.agent2_user_items_negs_tsv),
+            user_items_negs_tsv=str(per_user_agent2_user_items_negs),
             agent2_item_desc_tsv=str(agent2_item_desc_tsv),
             global_db=shared_global_db_path or str(user_dir / "global_item_features.db"),
             history_db=shared_history_db_path or str(user_dir / "user_history_log.db"),
