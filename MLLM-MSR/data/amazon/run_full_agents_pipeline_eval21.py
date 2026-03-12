@@ -385,6 +385,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-users", type=int, default=0, help="0 means all selected users")
     parser.add_argument("--exclude-seen-for-negatives", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--disable-agent3-item-type-filter",
+        action="store_true",
+        help=(
+            "Disable Agent3 preliminary recall by item type/category. "
+            "When enabled, Agent3 sends the whole current eval21 user catalog (20neg+1pos) to Agent5."
+        ),
+    )
 
     parser.add_argument("--eval-run-root", default="./processed/eval21_runs")
     parser.add_argument("--prepare-only", action="store_true")
@@ -531,6 +539,8 @@ def main(args: argparse.Namespace) -> None:
             max_history_rows=int(args.max_history_rows),
             top_n=int(args.top_n),
             positive_history_only=bool(args.positive_history_only),
+            filter_candidates_by_item_type=not bool(args.disable_agent3_item_type_filter),
+            candidate_item_ids_scope=list(eval21_items),
         )
 
         run_pipeline(run_args)

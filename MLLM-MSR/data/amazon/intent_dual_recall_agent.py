@@ -285,6 +285,36 @@ class GlobalHistoryAccessor:
 
         return recalled[:max_items], rollup_paths
 
+    def fetch_global_items_by_ids(
+        self,
+        item_ids: Sequence[str],
+        max_items: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Fetch global catalog items by provided item-id order."""
+        if not item_ids:
+            return []
+
+        rows = self.global_conn.execute(
+            "SELECT item_id, profile_json, updated_at FROM global_item_features"
+        ).fetchall()
+        row_map: Dict[str, Any] = {str(r["item_id"]): r for r in rows}
+
+        out: List[Dict[str, Any]] = []
+        for item_id in item_ids:
+            row = row_map.get(str(item_id))
+            if row is None:
+                continue
+            out.append(
+                {
+                    "item_id": str(row["item_id"]),
+                    "profile": json.loads(row["profile_json"]),
+                    "updated_at": row["updated_at"],
+                }
+            )
+            if len(out) >= max_items:
+                break
+        return out
+
     def recall_user_history(
         self,
         user_id: str,
@@ -493,6 +523,8 @@ class RoutingRecallAgent:
         interested_item_types_k: int = 3,
         exclude_seen_items: bool = True,
         seen_history_lookback: int = 5000,
+        filter_candidates_by_item_type: bool = True,
+        candidate_item_ids_scope: Optional[Sequence[str]] = None,
         save_output: bool = True,
         output_dir: str | Path = "./processed/intent_dual_recall_outputs",
     ) -> IntentDualRecallOutput:
@@ -524,12 +556,19 @@ class RoutingRecallAgent:
         if not routing.category_paths and routing.item_types:
             routing.category_paths = [[routing.item_types[0]]]
 
-        candidate_items, final_rollup_paths = self.accessor.recall_global_items(
-            routing.category_paths,
-            routing.item_types,
-            min_items=min_candidate_items,
-            max_items=max_candidate_items,
-        )
+        if filter_candidates_by_item_type:
+            candidate_items, final_rollup_paths = self.accessor.recall_global_items(
+                routing.category_paths,
+                routing.item_types,
+                min_items=min_candidate_items,
+                max_items=max_candidate_items,
+            )
+        else:
+            candidate_items = self.accessor.fetch_global_items_by_ids(
+                item_ids=list(candidate_item_ids_scope or []),
+                max_items=max_candidate_items,
+            )
+            final_rollup_paths = [list(p) for p in routing.category_paths]
 
         if clean_query:
             history_rows = self.accessor.recall_user_history(
@@ -545,7 +584,7 @@ class RoutingRecallAgent:
             )
 
         seen_item_ids: set[str] = set()
-        if exclude_seen_items:
+        if exclude_seen_items and filter_candidates_by_item_type:
             seen_item_ids = self.accessor.user_seen_item_ids(
                 user_id=user_id,
                 lookback=seen_history_lookback,
@@ -570,6 +609,8 @@ class RoutingRecallAgent:
                 "seen_history_lookback": int(seen_history_lookback),
                 "seen_item_count": len(seen_item_ids),
                 "final_rollup_paths": final_rollup_paths,
+                "filter_candidates_by_item_type": bool(filter_candidates_by_item_type),
+                "candidate_item_scope_size": len(candidate_item_ids_scope or []),
                 "catalog_size": {
                     "category_paths": len(category_catalog),
                     "item_types": len(item_type_catalog),
