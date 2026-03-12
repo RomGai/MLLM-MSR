@@ -313,6 +313,8 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             min_candidate_items=args.min_candidate_items,
             max_candidate_items=args.max_candidate_items,
             max_history_rows=args.max_history_rows,
+            filter_candidates_by_item_type=bool(getattr(args, "filter_candidates_by_item_type", True)),
+            candidate_item_ids_scope=getattr(args, "candidate_item_ids_scope", None),
             save_output=True,
             output_dir=args.intent_output_dir,
         )
@@ -387,6 +389,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-history-rows", type=int, default=200)
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument(
+        "--disable-agent3-item-type-filter",
+        action="store_true",
+        help="Disable Agent3 item-type/category filtering and pass full scoped candidate catalog to Agent5.",
+    )
+    parser.add_argument(
         "--positive-history-only",
         action="store_true",
         help="Use only positive history rows in Agent2/Agent3 and ignore Must_Avoid constraints in Agent5.",
@@ -396,5 +403,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     cli_args = build_argparser().parse_args()
+    cli_args.filter_candidates_by_item_type = not bool(getattr(cli_args, "disable_agent3_item_type_filter", False))
+    cli_args.candidate_item_ids_scope = None
     summary = run_pipeline(cli_args)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
