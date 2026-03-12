@@ -195,6 +195,22 @@ class Qwen3VLExtractor:
 
         return None
 
+
+
+    @staticmethod
+    def _normalize_image_paths(image_paths: List[str]) -> List[str]:
+        """Drop empty/obviously invalid image entries before processor ingestion."""
+        cleaned: List[str] = []
+        for p in image_paths:
+            cand = str(p or "").strip()
+            if not cand:
+                continue
+            # Avoid placeholders that are known to break image loading.
+            if cand in {".", "./", "..", "../"}:
+                continue
+            cleaned.append(cand)
+        return cleaned
+
     def extract(
         self,
         prompt: str,
@@ -202,7 +218,8 @@ class Qwen3VLExtractor:
     ) -> Dict[str, Any]:
         self.load()
 
-        image_messages = [{"type": "image", "image": path} for path in image_paths]
+        valid_image_paths = self._normalize_image_paths(image_paths)
+        image_messages = [{"type": "image", "image": path} for path in valid_image_paths]
         messages = [
             {
                 "role": "user",
@@ -213,7 +230,14 @@ class Qwen3VLExtractor:
             }
         ]
 
-        generated_text = self._generate_text(messages)
+        try:
+            generated_text = self._generate_text(messages)
+        except Exception as exc:
+            # Some rows contain invalid image URLs/paths; fallback to text-only profiling.
+            print(f"[Qwen3VLExtractor] image loading failed, fallback to text-only: {exc}")
+            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+            generated_text = self._generate_text(messages)
+
         parsed = self._try_json_decode(generated_text)
         if parsed is not None:
             return parsed
@@ -236,6 +260,22 @@ class Qwen3VLExtractor:
                     ],
                 }
             ]
+            if not image_messages:
+                strict_messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    prompt
+                                    + "\n\nIMPORTANT: Output exactly one valid JSON object only. "
+                                    + "Do not include markdown/code fences/comments/trailing text."
+                                ),
+                            }
+                        ],
+                    }
+                ]
             generated_text = self._generate_text(strict_messages, force_greedy=True)
             parsed = self._try_json_decode(generated_text)
             if parsed is not None:
