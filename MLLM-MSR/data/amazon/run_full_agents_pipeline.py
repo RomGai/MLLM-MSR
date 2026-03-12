@@ -17,6 +17,7 @@ import argparse
 import json
 import sqlite3
 import zipfile
+from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -49,6 +50,8 @@ def _collect_all_labeled_history_rows(
     for row in expand_pos_neg_rows(user_items_negs_path):
         user_id = str(row["user_id"])
         item_id = str(row["item_id"])
+        if user_id not in processed_user_ids:
+            processed_user_ids.add(user_id)
         behavior = str(row["behavior"])
         ts = ts_map.get((user_id, item_id))
 
@@ -109,10 +112,42 @@ def _list_saved_agent3_outputs(output_dir: str | Path) -> List[Path]:
     return sorted(out_dir.glob("*_intent_dual_recall_output.json"))
 
 
+
+
+def _progress_bar(current: int, total: int, width: int = 24) -> str:
+    total = max(1, int(total))
+    current = min(max(0, int(current)), total)
+    filled = int(width * current / total)
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _build_user_sample_progress(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    per_user_total: Dict[str, int] = defaultdict(int)
+    for r in rows:
+        per_user_total[str(r.get("user_id", ""))] += 1
+
+    return {u: {"done": 0, "total": t} for u, t in per_user_total.items()}
+
+
+
+
+def _progress_interval(total: int) -> int:
+    """Adaptive logging interval to avoid silent long gaps on small runs."""
+    if total <= 100:
+        return 1
+    if total <= 1000:
+        return 10
+    return 50
+
+
 def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     from intent_dual_recall_agent import GlobalHistoryAccessor, Qwen3RouterLLM, RoutingRecallAgent
 
     item_map = load_item_desc_tsv(args.item_desc_tsv)
+    fallback_item_map: Dict[str, Dict[str, str]] = {}
+    fallback_item_desc_tsv = str(getattr(args, "agent2_item_desc_tsv", "") or "").strip()
+    if fallback_item_desc_tsv:
+        fallback_item_map = load_item_desc_tsv(fallback_item_desc_tsv)
 
     candidate_profiler, history_profiler = bootstrap_agents_from_processed(
         item_desc_tsv=args.item_desc_tsv,
@@ -129,8 +164,9 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     candidate_profile_records: List[Dict[str, Any]] = []
     all_item_ids = list(item_map.keys())
     print(f"[Agent 1] Processing all items: {len(all_item_ids)}")
+    item_progress_interval = _progress_interval(len(all_item_ids))
 
-    for item_id in all_item_ids:
+    for item_idx, item_id in enumerate(all_item_ids, start=1):
         meta = item_map[item_id]
         item = ItemProfileInput(
             item_id=item_id,
@@ -156,6 +192,11 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 "profile": profile,
             }
         )
+        if item_idx == 1 or item_idx % item_progress_interval == 0 or item_idx == len(all_item_ids):
+            print(
+                f"[Agent 1][Item Progress] {item_idx}/{len(all_item_ids)} "
+                f"{_progress_bar(item_idx, len(all_item_ids))} item_id={item_id} source={profile_source}"
+            )
 
     # Agent 2: all users' labeled sequences
     all_history_rows = _collect_all_labeled_history_rows(
@@ -165,13 +206,16 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     history_meta_records: List[Dict[str, Any]] = []
     history_profile_records: List[Dict[str, Any]] = []
     print(f"[Agent 2] Processing all labeled history rows: {len(all_history_rows)}")
+    user_sample_progress = _build_user_sample_progress(all_history_rows)
+    total_users_with_history = len(user_sample_progress)
+    processed_user_ids: set[str] = set()
 
-    for row in all_history_rows:
+    for row_idx, row in enumerate(all_history_rows, start=1):
         user_id = str(row["user_id"])
         item_id = str(row["item_id"])
         timestamp_raw = row.get("timestamp")
         timestamp: Optional[int] = None if timestamp_raw is None else int(timestamp_raw)
-        meta = item_map.get(item_id, {"image": "", "summary": ""})
+        meta = item_map.get(item_id) or fallback_item_map.get(item_id, {"image": "", "summary": ""})
 
         hist_item = HistoryItemProfileInput(
             item_id=item_id,
@@ -234,6 +278,16 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             }
         )
 
+        user_sample_progress[user_id]["done"] += 1
+        user_done = user_sample_progress[user_id]["done"]
+        user_total = user_sample_progress[user_id]["total"]
+        if user_done == 1 or user_done % 10 == 0 or user_done == user_total:
+            print(
+                f"[Agent 2][User Progress] user {len(processed_user_ids)}/{total_users_with_history} "
+                f"(user_id={user_id}) sample {user_done}/{user_total} {_progress_bar(user_done, user_total)} | "
+                f"overall {row_idx}/{len(all_history_rows)}"
+            )
+
     _write_jsonl(run_out_dir / "candidate_meta.jsonl", candidate_meta_records)
     _write_jsonl(run_out_dir / "history_meta.jsonl", history_meta_records)
     _write_jsonl(run_out_dir / "candidate_profiles.jsonl", candidate_profile_records)
@@ -262,7 +316,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     accessor = GlobalHistoryAccessor(args.global_db, args.history_db)
     recall_agent = RoutingRecallAgent(llm=router, accessor=accessor)
 
-    for user_id in all_user_ids:
+    for user_idx, user_id in enumerate(all_user_ids, start=1):
         out = recall_agent.run(
             user_id=user_id,
             query=args.query,
@@ -274,7 +328,8 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         )
         print(
             f"[Agent 3] user={user_id}, candidate_items={len(out.candidate_items)}, "
-            f"history_rows={len(out.query_relevant_history)}"
+            f"history_rows={len(out.query_relevant_history)} | "
+            f"progress {user_idx}/{len(all_user_ids)} {_progress_bar(user_idx, len(all_user_ids))}"
         )
 
     # Agent 4+5: iterate every agent3 output file automatically
@@ -317,6 +372,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--item-desc-tsv", default="./processed/Video_Games_item_desc.tsv")
     parser.add_argument("--user-pairs-tsv", default="./processed/Video_Games_u_i_pairs.tsv")
     parser.add_argument("--user-items-negs-tsv", default="./processed/Video_Games_user_items_negs.tsv")
+    parser.add_argument(
+        "--agent2-item-desc-tsv",
+        default="",
+        help="Optional full item_desc tsv for Agent2 metadata fallback when Agent1 uses filtered catalog",
+    )
 
     parser.add_argument("--global-db", default="./processed/global_item_features.db")
     parser.add_argument("--history-db", default="./processed/user_history_log.db")
