@@ -129,6 +129,17 @@ def _build_user_sample_progress(rows: List[Dict[str, Any]]) -> Dict[str, Dict[st
     return {u: {"done": 0, "total": t} for u, t in per_user_total.items()}
 
 
+
+
+def _progress_interval(total: int) -> int:
+    """Adaptive logging interval to avoid silent long gaps on small runs."""
+    if total <= 100:
+        return 1
+    if total <= 1000:
+        return 10
+    return 50
+
+
 def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     from intent_dual_recall_agent import GlobalHistoryAccessor, Qwen3RouterLLM, RoutingRecallAgent
 
@@ -153,6 +164,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     candidate_profile_records: List[Dict[str, Any]] = []
     all_item_ids = list(item_map.keys())
     print(f"[Agent 1] Processing all items: {len(all_item_ids)}")
+    item_progress_interval = _progress_interval(len(all_item_ids))
 
     for item_idx, item_id in enumerate(all_item_ids, start=1):
         meta = item_map[item_id]
@@ -180,8 +192,11 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 "profile": profile,
             }
         )
-        if item_idx == 1 or item_idx % 50 == 0 or item_idx == len(all_item_ids):
-            print(f"[Agent 1][Item Progress] {item_idx}/{len(all_item_ids)} {_progress_bar(item_idx, len(all_item_ids))}")
+        if item_idx == 1 or item_idx % item_progress_interval == 0 or item_idx == len(all_item_ids):
+            print(
+                f"[Agent 1][Item Progress] {item_idx}/{len(all_item_ids)} "
+                f"{_progress_bar(item_idx, len(all_item_ids))} item_id={item_id} source={profile_source}"
+            )
 
     # Agent 2: all users' labeled sequences
     all_history_rows = _collect_all_labeled_history_rows(
