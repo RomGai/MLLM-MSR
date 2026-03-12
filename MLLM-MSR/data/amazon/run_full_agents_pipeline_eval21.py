@@ -328,6 +328,11 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Optional shared global_item_features.db path reused across all users",
     )
     parser.add_argument(
+        "--global-db-path",
+        default="",
+        help="Alias of --shared-global-db-path for passing one reusable global DB path",
+    )
+    parser.add_argument(
         "--shared-history-db-path",
         default="",
         help="Optional shared user_history_log.db path reused across all users",
@@ -369,7 +374,7 @@ def main(args: argparse.Namespace) -> None:
     root.mkdir(parents=True, exist_ok=True)
 
     agent2_item_desc_tsv = str(args.agent2_item_desc_tsv or args.item_desc_tsv)
-    shared_global_db_path = str(args.shared_global_db_path or "").strip()
+    shared_global_db_path = str(args.shared_global_db_path or args.global_db_path or "").strip()
     shared_history_db_path = str(args.shared_history_db_path or "").strip()
     if shared_global_db_path:
         Path(shared_global_db_path).parent.mkdir(parents=True, exist_ok=True)
