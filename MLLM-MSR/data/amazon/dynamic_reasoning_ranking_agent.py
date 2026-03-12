@@ -229,6 +229,7 @@ def run_module3(
     intent_dual_recall_output: Dict[str, Any],
     model_name: str = "Qwen/Qwen3-8B",
     top_n: int = 20,
+    disable_must_avoid: bool = False,
     save_output: bool = True,
     output_dir: str | Path = "./processed/dynamic_reasoning_ranking_outputs",
 ) -> Module3Output:
@@ -243,6 +244,8 @@ def run_module3(
         llm=Qwen3DynamicReasonerLLM(model_name=model_name)
     )
     constraints = reasoner.run(query=query, query_relevant_history=history_rows)
+    if disable_must_avoid:
+        constraints.must_avoid = []
 
     ranker = RankingScoringAgent(reranker=LLMItemReranker(model_name=model_name))
     ranked_items = ranker.run(
