@@ -159,3 +159,9 @@ python run_full_agents_pipeline_eval21.py \
 - 若该文件负样本不足 20，脚本会从全商品池中按随机种子补齐到 20（可选排除该用户历史看过商品）。
 - 最终确保 Agent 1 的商品输入恰好 21 个 item。
 - 脚本按用户循环处理；每处理完一个 user 会实时打印当前累计指标（AUC / Recall@K / MRR@K / NDCG@K），指标公式与 `test_with_llava.py` 保持一致的分组口径。
+
+
+补充（共享商品库复用）：
+- 可通过 `--shared-global-db-path` 指定一个共享的商品库 DB（`global_item_features.db`），所有 user 复用同一库。
+- 可通过 `--shared-history-db-path` 指定共享历史库，避免重复写入历史画像。
+- 可通过 `--agent2-item-desc-tsv` 为 Agent2 提供完整商品元数据回退源；当当前 21-item 输入中不存在某个历史 item 时，Agent2 会从该文件取 `image/summary`，并在全局商品库缺失时按 Agent1 逻辑补建该 item 的画像。

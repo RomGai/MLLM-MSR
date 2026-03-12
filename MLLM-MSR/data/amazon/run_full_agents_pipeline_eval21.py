@@ -147,6 +147,13 @@ def _write_filtered_item_desc(rows: Sequence[Dict[str, str]], keep_item_ids: Set
                 writer.writerow(row)
 
 
+def _progress_bar(current: int, total: int, width: int = 24) -> str:
+    total = max(1, int(total))
+    current = min(max(0, int(current)), total)
+    filled = int(width * current / total)
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
 # ------- Metrics (aligned with test_with_llava grouped ranking part) -------
 def recall_at_k(y_true: List[List[int]], y_prob: List[List[float]], k: int) -> float:
     recalls = []
@@ -272,6 +279,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--user-pairs-tsv", default="./processed/Video_Games_u_i_pairs.tsv")
     parser.add_argument("--eval-user-items-negs-tsv", default="./processed/Video_Games_user_items_negs_test.csv")
     parser.add_argument("--agent2-user-items-negs-tsv", default="./processed/Video_Games_user_items_negs.tsv")
+    parser.add_argument(
+        "--agent2-item-desc-tsv",
+        default="",
+        help="Optional full item_desc tsv for Agent2 metadata fallback; defaults to --item-desc-tsv",
+    )
 
     parser.add_argument("--target-user-id", default="")
     parser.add_argument("--target-user-row-index", type=int, default=0)
@@ -283,6 +295,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-run-root", default="./processed/eval21_runs")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--bundle-output", default="./processed/eval21_runs/final_bundle.zip")
+    parser.add_argument(
+        "--shared-global-db-path",
+        default="",
+        help="Optional shared global_item_features.db path reused across all users",
+    )
+    parser.add_argument(
+        "--shared-history-db-path",
+        default="",
+        help="Optional shared user_history_log.db path reused across all users",
+    )
 
     full_defaults = vars(build_full_argparser().parse_args(["--bundle-output", "dummy.zip"]))
     forward_keys = [
@@ -315,6 +337,14 @@ def main(args: argparse.Namespace) -> None:
     root = Path(args.eval_run_root)
     root.mkdir(parents=True, exist_ok=True)
 
+    agent2_item_desc_tsv = str(args.agent2_item_desc_tsv or args.item_desc_tsv)
+    shared_global_db_path = str(args.shared_global_db_path or "").strip()
+    shared_history_db_path = str(args.shared_history_db_path or "").strip()
+    if shared_global_db_path:
+        Path(shared_global_db_path).parent.mkdir(parents=True, exist_ok=True)
+    if shared_history_db_path:
+        Path(shared_history_db_path).parent.mkdir(parents=True, exist_ok=True)
+
     grouped_labels: List[List[int]] = []
     grouped_scores: List[List[float]] = []
 
@@ -327,6 +357,11 @@ def main(args: argparse.Namespace) -> None:
         selected_positive = unit.pos_items[args.positive_index]
         if selected_positive not in item_map:
             raise KeyError(f"positive item {selected_positive} missing in item-desc-tsv")
+
+        print(
+            f"[Eval21][Input Progress] user {idx}/{total} {_progress_bar(idx, total)} "
+            f"(user_id={unit.user_id}) sample 1/1 {_progress_bar(1, 1)}"
+        )
 
         user_seen = _user_seen_items(args.user_pairs_tsv, unit.user_id)
         eval21_items = _build_eval21_catalog(
@@ -349,6 +384,8 @@ def main(args: argparse.Namespace) -> None:
             "selected_positive_item": selected_positive,
             "eval21_items": eval21_items,
             "selected_group_size": len(eval21_items),
+            "global_db_path": shared_global_db_path or str(user_dir / "global_item_features.db"),
+            "history_db_path": shared_history_db_path or str(user_dir / "user_history_log.db"),
         }
         (user_dir / "eval21_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -360,8 +397,9 @@ def main(args: argparse.Namespace) -> None:
             item_desc_tsv=str(prepared_item_desc),
             user_pairs_tsv=str(args.user_pairs_tsv),
             user_items_negs_tsv=str(args.agent2_user_items_negs_tsv),
-            global_db=str(user_dir / "global_item_features.db"),
-            history_db=str(user_dir / "user_history_log.db"),
+            agent2_item_desc_tsv=str(agent2_item_desc_tsv),
+            global_db=shared_global_db_path or str(user_dir / "global_item_features.db"),
+            history_db=shared_history_db_path or str(user_dir / "user_history_log.db"),
             profiler_run_out_dir=str(user_dir / "profiler_runs"),
             intent_output_dir=str(user_dir / "intent_dual_recall_outputs"),
             dynamic_output_dir=str(user_dir / "dynamic_reasoning_ranking_outputs"),
