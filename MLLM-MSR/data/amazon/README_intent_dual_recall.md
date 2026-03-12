@@ -158,3 +158,4 @@ python run_full_agents_pipeline_eval21.py \
 - `--eval-user-items-negs-tsv` 用于挑选“评测单元”（用户 + 正样本 + 负样本来源）。
 - 若该文件负样本不足 20，脚本会从全商品池中按随机种子补齐到 20（可选排除该用户历史看过商品）。
 - 最终确保 Agent 1 的商品输入恰好 21 个 item。
+- 脚本按用户循环处理；每处理完一个 user 会实时打印当前累计指标（AUC / Recall@K / MRR@K / NDCG@K），指标公式与 `test_with_llava.py` 保持一致的分组口径。

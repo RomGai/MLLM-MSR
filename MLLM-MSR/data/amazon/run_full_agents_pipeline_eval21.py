@@ -1,22 +1,11 @@
-"""Build a 21-item (1 positive + 20 negatives) evaluation catalog before Agent 1.
+"""Run Amazon full agents pipeline with per-user eval21 item catalogs.
 
-Goal:
-- Align with the fixed-size evaluation grouping used by `test/microlens/test_with_llava.py`
-  where metrics are computed after `reshape(-1, 21)`.
-- Treat the 21 items as the *full* item catalog seen by Agent 1.
-- Keep Agent 2 user-history modeling unchanged (use full history files as-is).
-
-Workflow:
-1) Select one evaluation unit from `*_user_items_negs_test.csv` (or compatible file):
-   - one user
-   - one positive item from the user's positive list
-2) Build 20 negatives:
-   - start from row-provided negatives
-   - top up by deterministic random sampling from global items, excluding the chosen
-     positive and (by default) that user's seen items.
-3) Materialize a filtered `item_desc.tsv` containing exactly 21 items.
-4) Invoke `run_full_agents_pipeline.py` using this filtered item catalog, while
-   retaining original history inputs for Agent 2.
+Key behavior:
+- For each evaluation user, build a 21-item catalog (1 positive + 20 negatives)
+  BEFORE Agent 1, and use it as Agent 1's full item input.
+- Agent 2 keeps normal full-history processing.
+- After each user is processed, print cumulative metrics using the same grouped
+  ranking metrics style as `test/microlens/test_with_llava.py`.
 """
 
 from __future__ import annotations
@@ -24,6 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,7 +99,6 @@ def _build_eval21_catalog(
     exclude_seen_for_negatives: bool,
 ) -> List[str]:
     rng = random.Random(seed)
-
     negatives: List[str] = []
     used = {chosen_positive}
 
@@ -134,14 +123,12 @@ def _build_eval21_catalog(
     rng.shuffle(candidate_pool)
     for item_id in candidate_pool:
         negatives.append(item_id)
-        used.add(item_id)
         if len(negatives) >= 20:
             break
 
     if len(negatives) < 20:
         raise ValueError(
-            f"Cannot build 20 negatives for user={unit.user_id}. "
-            f"Only got {len(negatives)} negatives after filtering."
+            f"Cannot build 20 negatives for user={unit.user_id}; got {len(negatives)}"
         )
 
     group = [chosen_positive] + negatives[:20]
@@ -160,65 +147,145 @@ def _write_filtered_item_desc(rows: Sequence[Dict[str, str]], keep_item_ids: Set
                 writer.writerow(row)
 
 
+# ------- Metrics (aligned with test_with_llava grouped ranking part) -------
+def recall_at_k(y_true: List[List[int]], y_prob: List[List[float]], k: int) -> float:
+    recalls = []
+    for labels, probs in zip(y_true, y_prob):
+        ranked = [x for _, x in sorted(zip(probs, labels), key=lambda t: t[0], reverse=True)]
+        retrieved_positives = sum(ranked[:k])
+        total_positives = 1  # same assumption as test_with_llava pipeline setting
+        recalls.append(retrieved_positives / total_positives)
+    return sum(recalls) / len(recalls) if recalls else 0.0
+
+
+def mrr_at_k(y_true: List[List[int]], y_prob: List[List[float]], k: int) -> float:
+    rr = []
+    for labels, probs in zip(y_true, y_prob):
+        ranked = [x for _, x in sorted(zip(probs, labels), key=lambda t: t[0], reverse=True)]
+        val = 0.0
+        for i, l in enumerate(ranked[:k]):
+            if l == 1:
+                val = 1.0 / (i + 1)
+                break
+        rr.append(val)
+    return sum(rr) / len(rr) if rr else 0.0
+
+
+def ndcg_at_k(y_true: List[List[int]], y_prob: List[List[float]], k: int) -> float:
+    out = []
+    for labels, probs in zip(y_true, y_prob):
+        ranked = [x for _, x in sorted(zip(probs, labels), key=lambda t: t[0], reverse=True)][:k]
+        dcg = 0.0
+        for i, rel in enumerate(ranked, start=1):
+            dcg += (2**rel - 1) / math.log2(i + 1)
+
+        ideal = sorted(labels, reverse=True)[:k]
+        idcg = 0.0
+        for i, rel in enumerate(ideal, start=1):
+            idcg += (2**rel - 1) / math.log2(i + 1)
+
+        out.append(dcg / (idcg + 1e-10))
+    return sum(out) / len(out) if out else 0.0
+
+
+def roc_auc_binary(y_true_flat: List[int], y_score_flat: List[float]) -> float:
+    # Mann-Whitney U implementation
+    n = len(y_true_flat)
+    pairs = sorted([(s, y) for s, y in zip(y_score_flat, y_true_flat)], key=lambda x: x[0])
+
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and pairs[j + 1][0] == pairs[i][0]:
+            j += 1
+        avg_rank = (i + 1 + j + 1) / 2.0
+        for t in range(i, j + 1):
+            ranks[t] = avg_rank
+        i = j + 1
+
+    pos = 0
+    neg = 0
+    rank_sum_pos = 0.0
+    for r, (_, y) in zip(ranks, pairs):
+        if y == 1:
+            pos += 1
+            rank_sum_pos += r
+        else:
+            neg += 1
+    if pos == 0 or neg == 0:
+        return 0.0
+    return (rank_sum_pos - pos * (pos + 1) / 2.0) / (pos * neg)
+
+
+def _collect_group_scores(
+    eval21_items: Sequence[str],
+    selected_positive: str,
+    ranked_items: Sequence[Dict[str, object]],
+) -> Tuple[List[int], List[float]]:
+    score_map: Dict[str, float] = {}
+    for x in ranked_items:
+        iid = str(x.get("item_id", ""))
+        s = float(x.get("ranking_score", 0.0))
+        if iid:
+            score_map[iid] = s
+
+    min_s = min(score_map.values()) if score_map else 0.0
+    fallback = min_s - 1.0
+
+    labels: List[int] = []
+    scores: List[float] = []
+    for iid in eval21_items:
+        labels.append(1 if iid == selected_positive else 0)
+        scores.append(score_map.get(iid, fallback))
+    return labels, scores
+
+
+def _pick_units(units: List[EvalUnit], target_user_id: str, target_user_row_index: int, max_users: int) -> List[EvalUnit]:
+    if target_user_id:
+        user_units = [u for u in units if u.user_id == target_user_id]
+        if not user_units:
+            raise ValueError(f"target-user-id={target_user_id} not found")
+        idx = max(0, int(target_user_row_index))
+        if idx >= len(user_units):
+            raise IndexError(f"target-user-row-index={idx} out of range: {len(user_units)}")
+        chosen = [user_units[idx]]
+    else:
+        # keep first row per user to match "每处理完一个user"
+        seen: Set[str] = set()
+        chosen = []
+        for u in units:
+            if u.user_id in seen:
+                continue
+            seen.add(u.user_id)
+            chosen.append(u)
+
+    if max_users > 0:
+        chosen = chosen[:max_users]
+    return chosen
+
+
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Prebuild 21-item (1+20) catalog then run full Amazon agents pipeline"
-    )
+    parser = argparse.ArgumentParser(description="Per-user eval21 runner for Amazon full agents pipeline")
 
     parser.add_argument("--item-desc-tsv", default="./processed/Video_Games_item_desc.tsv")
     parser.add_argument("--user-pairs-tsv", default="./processed/Video_Games_u_i_pairs.tsv")
-    parser.add_argument(
-        "--eval-user-items-negs-tsv",
-        default="./processed/Video_Games_user_items_negs_test.csv",
-        help="Evaluation split file containing user_id, pos, neg",
-    )
-    parser.add_argument(
-        "--agent2-user-items-negs-tsv",
-        default="./processed/Video_Games_user_items_negs.tsv",
-        help="Agent 2 input (kept full/normal, not restricted to 21-catalog)",
-    )
+    parser.add_argument("--eval-user-items-negs-tsv", default="./processed/Video_Games_user_items_negs_test.csv")
+    parser.add_argument("--agent2-user-items-negs-tsv", default="./processed/Video_Games_user_items_negs.tsv")
 
-    parser.add_argument("--target-user-id", default="", help="Optional fixed user for one eval unit")
-    parser.add_argument(
-        "--target-user-row-index",
-        type=int,
-        default=0,
-        help="If target-user-id has multiple rows, pick this row index",
-    )
-    parser.add_argument(
-        "--positive-index",
-        type=int,
-        default=0,
-        help="Pick which positive item from the row's pos list",
-    )
-    parser.add_argument(
-        "--exclude-seen-for-negatives",
-        action="store_true",
-        help="Sample extra negatives excluding this user's seen items",
-    )
+    parser.add_argument("--target-user-id", default="")
+    parser.add_argument("--target-user-row-index", type=int, default=0)
+    parser.add_argument("--positive-index", type=int, default=0)
+    parser.add_argument("--max-users", type=int, default=0, help="0 means all selected users")
+    parser.add_argument("--exclude-seen-for-negatives", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
 
-    parser.add_argument(
-        "--prepared-item-desc-out",
-        default="./processed/eval21_item_desc.tsv",
-        help="Filtered 21-item catalog tsv for Agent 1",
-    )
-    parser.add_argument(
-        "--eval-unit-meta-out",
-        default="./processed/eval21_unit_meta.json",
-        help="Metadata of selected eval unit and 21-item catalog",
-    )
-
-    parser.add_argument("--bundle-output", required=True)
-    parser.add_argument("--prepare-only", action="store_true", help="Only prepare 21-item catalog and metadata, do not run full pipeline")
+    parser.add_argument("--eval-run-root", default="./processed/eval21_runs")
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--bundle-output", default="./processed/eval21_runs/final_bundle.zip")
 
     full_defaults = vars(build_full_argparser().parse_args(["--bundle-output", "dummy.zip"]))
     forward_keys = [
-        "global_db",
-        "history_db",
-        "profiler_run_out_dir",
-        "intent_output_dir",
-        "dynamic_output_dir",
         "vl_model",
         "text_model",
         "category_hint",
@@ -230,7 +297,6 @@ def build_argparser() -> argparse.ArgumentParser:
     ]
     for key in forward_keys:
         parser.add_argument(f"--{key.replace('_', '-')}", default=full_defaults[key])
-
     return parser
 
 
@@ -239,94 +305,131 @@ def main(args: argparse.Namespace) -> None:
     item_map = {r["item_id"]: r for r in item_rows}
     all_item_ids = list(item_map.keys())
     if len(all_item_ids) < 21:
-        raise ValueError("Item catalog size is < 21, cannot construct 1+20 evaluation unit.")
+        raise ValueError("item-desc-tsv has <21 items")
 
-    units = _read_user_items_negs(args.eval_user_items_negs_tsv)
-    if not units:
-        raise ValueError("No valid rows found in eval-user-items-negs-tsv.")
+    units_all = _read_user_items_negs(args.eval_user_items_negs_tsv)
+    if not units_all:
+        raise ValueError("No valid eval rows")
+    units = _pick_units(units_all, str(args.target_user_id), int(args.target_user_row_index), int(args.max_users))
 
-    if args.target_user_id:
-        user_units = [u for u in units if u.user_id == str(args.target_user_id)]
-        if not user_units:
-            raise ValueError(f"target-user-id={args.target_user_id} not found in eval file.")
-        idx = max(0, int(args.target_user_row_index))
-        if idx >= len(user_units):
-            raise IndexError(f"target-user-row-index={idx} out of range: {len(user_units)} rows")
-        unit = user_units[idx]
-    else:
-        unit = units[0]
+    root = Path(args.eval_run_root)
+    root.mkdir(parents=True, exist_ok=True)
 
-    if args.positive_index < 0 or args.positive_index >= len(unit.pos_items):
-        raise IndexError(
-            f"positive-index={args.positive_index} out of range for pos list size={len(unit.pos_items)}"
+    grouped_labels: List[List[int]] = []
+    grouped_scores: List[List[float]] = []
+
+    total = len(units)
+    for idx, unit in enumerate(units, start=1):
+        if args.positive_index < 0 or args.positive_index >= len(unit.pos_items):
+            raise IndexError(
+                f"positive-index={args.positive_index} out of range for user={unit.user_id}, pos size={len(unit.pos_items)}"
+            )
+        selected_positive = unit.pos_items[args.positive_index]
+        if selected_positive not in item_map:
+            raise KeyError(f"positive item {selected_positive} missing in item-desc-tsv")
+
+        user_seen = _user_seen_items(args.user_pairs_tsv, unit.user_id)
+        eval21_items = _build_eval21_catalog(
+            all_item_ids=all_item_ids,
+            unit=unit,
+            chosen_positive=selected_positive,
+            user_seen_item_ids=user_seen,
+            seed=int(args.seed) + idx,
+            exclude_seen_for_negatives=bool(args.exclude_seen_for_negatives),
         )
-    chosen_positive = unit.pos_items[args.positive_index]
-    if chosen_positive not in item_map:
-        raise KeyError(f"Selected positive item_id={chosen_positive} not found in item-desc-tsv")
 
-    seen_items = _user_seen_items(args.user_pairs_tsv, unit.user_id)
-    eval21_items = _build_eval21_catalog(
-        all_item_ids=all_item_ids,
-        unit=unit,
-        chosen_positive=chosen_positive,
-        user_seen_item_ids=seen_items,
-        seed=int(args.seed),
-        exclude_seen_for_negatives=bool(args.exclude_seen_for_negatives),
-    )
+        user_dir = root / f"user_{unit.user_id}"
+        user_dir.mkdir(parents=True, exist_ok=True)
 
-    _write_filtered_item_desc(
-        rows=item_rows,
-        keep_item_ids=set(eval21_items),
-        out_path=args.prepared_item_desc_out,
-    )
+        prepared_item_desc = user_dir / "eval21_item_desc.tsv"
+        _write_filtered_item_desc(item_rows, set(eval21_items), prepared_item_desc)
 
-    meta = {
-        "user_id": unit.user_id,
-        "selected_positive_item": chosen_positive,
-        "selected_group_size": len(eval21_items),
-        "eval21_items": eval21_items,
-        "from_eval_file": str(args.eval_user_items_negs_tsv),
-        "exclude_seen_for_negatives": bool(args.exclude_seen_for_negatives),
-        "seed": int(args.seed),
-    }
-    meta_out = Path(args.eval_unit_meta_out)
-    meta_out.parent.mkdir(parents=True, exist_ok=True)
-    meta_out.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        meta = {
+            "user_id": unit.user_id,
+            "selected_positive_item": selected_positive,
+            "eval21_items": eval21_items,
+            "selected_group_size": len(eval21_items),
+        }
+        (user_dir / "eval21_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        if args.prepare_only:
+            print(f"[Progress] {idx}/{total} prepared user={unit.user_id}, group_size={len(eval21_items)}")
+            continue
+
+        run_args = SimpleNamespace(
+            item_desc_tsv=str(prepared_item_desc),
+            user_pairs_tsv=str(args.user_pairs_tsv),
+            user_items_negs_tsv=str(args.agent2_user_items_negs_tsv),
+            global_db=str(user_dir / "global_item_features.db"),
+            history_db=str(user_dir / "user_history_log.db"),
+            profiler_run_out_dir=str(user_dir / "profiler_runs"),
+            intent_output_dir=str(user_dir / "intent_dual_recall_outputs"),
+            dynamic_output_dir=str(user_dir / "dynamic_reasoning_ranking_outputs"),
+            bundle_output=str(user_dir / "bundle.zip"),
+            vl_model=str(args.vl_model),
+            text_model=str(args.text_model),
+            category_hint=str(args.category_hint),
+            query=str(args.query),
+            min_candidate_items=int(args.min_candidate_items),
+            max_candidate_items=int(args.max_candidate_items),
+            max_history_rows=int(args.max_history_rows),
+            top_n=int(args.top_n),
+        )
+
+        run_pipeline(run_args)
+
+        dyn_path = Path(run_args.dynamic_output_dir) / f"user_{unit.user_id}_dynamic_reasoning_ranking_output.json"
+        if not dyn_path.exists():
+            raise FileNotFoundError(f"Dynamic output not found: {dyn_path}")
+        payload = json.loads(dyn_path.read_text(encoding="utf-8"))
+        ranked_items = list(payload.get("ranked_items", []))
+
+        labels, scores = _collect_group_scores(eval21_items, selected_positive, ranked_items)
+        grouped_labels.append(labels)
+        grouped_scores.append(scores)
+
+        y_true_flat = [x for row in grouped_labels for x in row]
+        y_score_flat = [x for row in grouped_scores for x in row]
+
+        auc = roc_auc_binary(y_true_flat, y_score_flat)
+        r3 = recall_at_k(grouped_labels, grouped_scores, 3)
+        r5 = recall_at_k(grouped_labels, grouped_scores, 5)
+        r10 = recall_at_k(grouped_labels, grouped_scores, 10)
+        m3 = mrr_at_k(grouped_labels, grouped_scores, 3)
+        m5 = mrr_at_k(grouped_labels, grouped_scores, 5)
+        m10 = mrr_at_k(grouped_labels, grouped_scores, 10)
+        n3 = ndcg_at_k(grouped_labels, grouped_scores, 3)
+        n5 = ndcg_at_k(grouped_labels, grouped_scores, 5)
+        n10 = ndcg_at_k(grouped_labels, grouped_scores, 10)
+
+        print(
+            f"[Progress] {idx}/{total} user={unit.user_id} | "
+            f"AUC={auc:.6f} Recall@3/5/10={r3:.6f}/{r5:.6f}/{r10:.6f} "
+            f"MRR@3/5/10={m3:.6f}/{m5:.6f}/{m10:.6f} "
+            f"NDCG@3/5/10={n3:.6f}/{n5:.6f}/{n10:.6f}"
+        )
 
     if args.prepare_only:
-        print(json.dumps({
-            "prepared_item_desc_out": str(args.prepared_item_desc_out),
-            "eval_unit_meta_out": str(args.eval_unit_meta_out),
-            "selected_group_size": len(eval21_items),
-        }, ensure_ascii=False, indent=2))
+        print(json.dumps({"prepared_users": total, "eval_run_root": str(root)}, ensure_ascii=False, indent=2))
         return
 
-    full_args = SimpleNamespace(
-        item_desc_tsv=str(args.prepared_item_desc_out),
-        user_pairs_tsv=str(args.user_pairs_tsv),
-        user_items_negs_tsv=str(args.agent2_user_items_negs_tsv),
-        global_db=str(args.global_db),
-        history_db=str(args.history_db),
-        profiler_run_out_dir=str(args.profiler_run_out_dir),
-        intent_output_dir=str(args.intent_output_dir),
-        dynamic_output_dir=str(args.dynamic_output_dir),
-        bundle_output=str(args.bundle_output),
-        vl_model=str(args.vl_model),
-        text_model=str(args.text_model),
-        category_hint=str(args.category_hint),
-        query=str(args.query),
-        min_candidate_items=int(args.min_candidate_items),
-        max_candidate_items=int(args.max_candidate_items),
-        max_history_rows=int(args.max_history_rows),
-        top_n=int(args.top_n),
-    )
-
-    summary = run_pipeline(full_args)
-    summary["prepared_item_desc_out"] = str(args.prepared_item_desc_out)
-    summary["eval_unit_meta_out"] = str(args.eval_unit_meta_out)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    final = {
+        "processed_users": len(grouped_labels),
+        "AUC": roc_auc_binary([x for r in grouped_labels for x in r], [x for r in grouped_scores for x in r]) if grouped_labels else 0.0,
+        "Recall@3": recall_at_k(grouped_labels, grouped_scores, 3) if grouped_labels else 0.0,
+        "Recall@5": recall_at_k(grouped_labels, grouped_scores, 5) if grouped_labels else 0.0,
+        "Recall@10": recall_at_k(grouped_labels, grouped_scores, 10) if grouped_labels else 0.0,
+        "MRR@3": mrr_at_k(grouped_labels, grouped_scores, 3) if grouped_labels else 0.0,
+        "MRR@5": mrr_at_k(grouped_labels, grouped_scores, 5) if grouped_labels else 0.0,
+        "MRR@10": mrr_at_k(grouped_labels, grouped_scores, 10) if grouped_labels else 0.0,
+        "NDCG@3": ndcg_at_k(grouped_labels, grouped_scores, 3) if grouped_labels else 0.0,
+        "NDCG@5": ndcg_at_k(grouped_labels, grouped_scores, 5) if grouped_labels else 0.0,
+        "NDCG@10": ndcg_at_k(grouped_labels, grouped_scores, 10) if grouped_labels else 0.0,
+        "eval_run_root": str(root),
+    }
+    (root / "metrics_summary.json").write_text(json.dumps(final, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(final, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
-    cli_args = build_argparser().parse_args()
-    main(cli_args)
+    main(build_argparser().parse_args())
