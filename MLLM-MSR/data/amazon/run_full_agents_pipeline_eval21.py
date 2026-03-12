@@ -360,7 +360,7 @@ def main(args: argparse.Namespace) -> None:
 
         print(
             f"[Eval21][Input Progress] user {idx}/{total} {_progress_bar(idx, total)} "
-            f"(user_id={unit.user_id}) sample 1/1 {_progress_bar(1, 1)}"
+            f"(user_id={unit.user_id}) sample 1/1 {_progress_bar(1, 1)} stage=input"
         )
 
         user_seen = _user_seen_items(args.user_pairs_tsv, unit.user_id)
@@ -415,6 +415,10 @@ def main(args: argparse.Namespace) -> None:
         )
 
         run_pipeline(run_args)
+        print(
+            f"[Eval21][Output Progress] user {idx}/{total} {_progress_bar(idx, total)} "
+            f"(user_id={unit.user_id}) sample 1/1 {_progress_bar(1, 1)} stage=output"
+        )
 
         dyn_path = Path(run_args.dynamic_output_dir) / f"user_{unit.user_id}_dynamic_reasoning_ranking_output.json"
         if not dyn_path.exists():

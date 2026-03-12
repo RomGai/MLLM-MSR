@@ -131,15 +131,6 @@ def _build_user_sample_progress(rows: List[Dict[str, Any]]) -> Dict[str, Dict[st
 
 
 
-def _progress_interval(total: int) -> int:
-    """Adaptive logging interval to avoid silent long gaps on small runs."""
-    if total <= 100:
-        return 1
-    if total <= 1000:
-        return 10
-    return 50
-
-
 def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     from intent_dual_recall_agent import GlobalHistoryAccessor, Qwen3RouterLLM, RoutingRecallAgent
 
@@ -164,8 +155,6 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     candidate_profile_records: List[Dict[str, Any]] = []
     all_item_ids = list(item_map.keys())
     print(f"[Agent 1] Processing all items: {len(all_item_ids)}")
-    item_progress_interval = _progress_interval(len(all_item_ids))
-
     for item_idx, item_id in enumerate(all_item_ids, start=1):
         meta = item_map[item_id]
         item = ItemProfileInput(
@@ -192,11 +181,10 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 "profile": profile,
             }
         )
-        if item_idx == 1 or item_idx % item_progress_interval == 0 or item_idx == len(all_item_ids):
-            print(
-                f"[Agent 1][Item Progress] {item_idx}/{len(all_item_ids)} "
-                f"{_progress_bar(item_idx, len(all_item_ids))} item_id={item_id} source={profile_source}"
-            )
+        print(
+            f"[Agent 1][Item Progress] {item_idx}/{len(all_item_ids)} "
+            f"{_progress_bar(item_idx, len(all_item_ids))} item_id={item_id} source={profile_source}"
+        )
 
     # Agent 2: all users' labeled sequences
     all_history_rows = _collect_all_labeled_history_rows(
@@ -281,12 +269,11 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         user_sample_progress[user_id]["done"] += 1
         user_done = user_sample_progress[user_id]["done"]
         user_total = user_sample_progress[user_id]["total"]
-        if user_done == 1 or user_done % 10 == 0 or user_done == user_total:
-            print(
-                f"[Agent 2][User Progress] user {len(processed_user_ids)}/{total_users_with_history} "
-                f"(user_id={user_id}) sample {user_done}/{user_total} {_progress_bar(user_done, user_total)} | "
-                f"overall {row_idx}/{len(all_history_rows)}"
-            )
+        print(
+            f"[Agent 2][User Progress] user {len(processed_user_ids)}/{total_users_with_history} "
+            f"(user_id={user_id}) sample {user_done}/{user_total} {_progress_bar(user_done, user_total)} | "
+            f"overall {row_idx}/{len(all_history_rows)}"
+        )
 
     _write_jsonl(run_out_dir / "candidate_meta.jsonl", candidate_meta_records)
     _write_jsonl(run_out_dir / "history_meta.jsonl", history_meta_records)
