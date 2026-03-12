@@ -351,6 +351,12 @@ def build_argparser() -> argparse.ArgumentParser:
     ]
     for key in forward_keys:
         parser.add_argument(f"--{key.replace('_', '-')}", default=full_defaults[key])
+    parser.add_argument(
+        "--positive-history-only",
+        action="store_true",
+        default=bool(full_defaults["positive_history_only"]),
+        help="Use only positive history rows in Agent2/Agent3 and ignore Must_Avoid constraints in Agent5.",
+    )
     return parser
 
 
@@ -457,6 +463,7 @@ def main(args: argparse.Namespace) -> None:
             max_candidate_items=int(args.max_candidate_items),
             max_history_rows=int(args.max_history_rows),
             top_n=int(args.top_n),
+            positive_history_only=bool(args.positive_history_only),
         )
 
         run_pipeline(run_args)

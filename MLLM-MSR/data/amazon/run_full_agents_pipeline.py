@@ -37,6 +37,7 @@ from item_profiler_agents import (
 def _collect_all_labeled_history_rows(
     user_pairs_tsv_path: str | Path,
     user_items_negs_path: str | Path,
+    include_negative: bool = True,
 ) -> List[Dict[str, Any]]:
     """Collect all users' labeled rows (positive + negative) with ordering.
 
@@ -51,6 +52,8 @@ def _collect_all_labeled_history_rows(
         user_id = str(row["user_id"])
         item_id = str(row["item_id"])
         behavior = str(row["behavior"])
+        if not include_negative and behavior == "negative":
+            continue
         ts = ts_map.get((user_id, item_id))
 
         if behavior == "positive" and ts is None:
@@ -188,6 +191,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     all_history_rows = _collect_all_labeled_history_rows(
         user_pairs_tsv_path=args.user_pairs_tsv,
         user_items_negs_path=args.user_items_negs_tsv,
+        include_negative=not bool(getattr(args, "positive_history_only", False)),
     )
     history_meta_records: List[Dict[str, Any]] = []
     history_profile_records: List[Dict[str, Any]] = []
@@ -329,6 +333,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             intent_dual_recall_output=payload,
             model_name=args.text_model,
             top_n=args.top_n,
+            disable_must_avoid=bool(getattr(args, "positive_history_only", False)),
             save_output=True,
             output_dir=args.dynamic_output_dir,
         )
@@ -381,6 +386,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-candidate-items", type=int, default=200)
     parser.add_argument("--max-history-rows", type=int, default=200)
     parser.add_argument("--top-n", type=int, default=20)
+    parser.add_argument(
+        "--positive-history-only",
+        action="store_true",
+        help="Use only positive history rows in Agent2/Agent3 and ignore Must_Avoid constraints in Agent5.",
+    )
     return parser
 
 
