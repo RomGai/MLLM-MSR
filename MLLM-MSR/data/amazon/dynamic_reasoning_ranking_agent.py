@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from reranker import LLMItemReranker
 
@@ -30,6 +30,7 @@ class PreferenceConstraints:
     must_have: List[str]
     nice_to_have: List[str]
     must_avoid: List[str]
+    next_item_predictions: List[Dict[str, str]]
     reasoning: str
 
     def to_dict(self) -> Dict[str, Any]:
@@ -37,6 +38,7 @@ class PreferenceConstraints:
             "Must_Have": self.must_have,
             "Nice_to_Have": self.nice_to_have,
             "Must_Avoid": self.must_avoid,
+            "Predicted_Next_Items": self.next_item_predictions,
             "Reasoning": self.reasoning,
         }
 
@@ -50,6 +52,39 @@ class Module3Output:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def _safe_timestamp(value: Any) -> Tuple[int, int]:
+    raw = str(value).strip()
+    if not raw:
+        return (1, -1)
+    try:
+        return (0, int(raw))
+    except (TypeError, ValueError):
+        return (1, -1)
+
+
+def _sort_history_by_time(history_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(history_rows, key=lambda r: _safe_timestamp(r.get("timestamp")))
+
+
+def _extract_candidate_item_type_tags(candidate_items: List[Dict[str, Any]], max_tags: int = 120) -> List[str]:
+    tags: List[str] = []
+    seen = set()
+    for item in candidate_items:
+        profile = item.get("profile", {}) or {}
+        taxonomy = profile.get("taxonomy", {}) or {}
+        item_types = taxonomy.get("item_types", [])
+        if not isinstance(item_types, list):
+            item_types = [item_types]
+        for t in item_types:
+            tag = str(t).strip()
+            if tag and tag not in seen:
+                seen.add(tag)
+                tags.append(tag)
+                if len(tags) >= max_tags:
+                    return tags
+    return tags
 
 
 class Qwen3DynamicReasonerLLM:
@@ -102,11 +137,12 @@ class Qwen3DynamicReasonerLLM:
                     continue
         return None
 
-    def infer_constraints(self, query: str, history_rows: List[Dict[str, Any]]) -> PreferenceConstraints:
+    def infer_constraints(self, query: str, history_rows: List[Dict[str, Any]], candidate_type_tags: List[str]) -> PreferenceConstraints:
         self.load()
 
+        sorted_history_rows = _sort_history_by_time(history_rows)
         history_for_prompt = []
-        for row in history_rows[:120]:
+        for row in sorted_history_rows[-120:]:
             history_for_prompt.append(
                 {
                     "item_id": row.get("item_id"),
@@ -135,29 +171,37 @@ class Qwen3DynamicReasonerLLM:
         if clean_query:
             prompt = (
                 "你是电商推荐系统中的实时偏好建模专家（Agent4）。\n"
-                "任务：根据用户当前query与相关历史正负行为，推理用户此刻偏好。\n"
+                "任务：根据用户当前query与相关历史正负行为，按时间顺序推理用户此刻偏好，并预测用户下一次最可能购买什么。\n"
                 "要求：\n"
                 "1) 明确区分 Must_Have / Nice_to_Have / Must_Avoid。\n"
                 "2) 若历史中存在可分析的视觉信息（如 visual_tags/图片衍生描述），Nice_to_Have 必须包含视觉偏好结论；若无可分析视觉信息，则不要引用或臆造不存在的视觉信息。\n"
-                "3) 必须结合 history 中 positive 与 negative 的对比证据。\n"
-                "4) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
-                f"5) {guardrail_block}\n"
-                "6) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Reasoning(字符串)。\n\n"
+                "3) history 已按 timestamp 升序给出：positive 需要按时间顺序分析演化偏好与已购买轨迹；negative 样本通常无可靠时序，不要按其时间先后推理。\n"
+                "4) 必须结合 history 中 positive 与 negative 的对比证据。\n"
+                "5) Must_Have 可为空（若无法确定硬约束，不要强行填写）。\n"
+                "6) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
+                "7) 结合候选池 item type tags，输出 Predicted_Next_Items（数组，严格 5 条），每条含 item_type/likelihood/evidence；likelihood 只能是 Most_Likely/Secondary/Possible。\n"
+                f"8) {guardrail_block}\n"
+                "9) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Predicted_Next_Items(数组), Reasoning(字符串)。\n\n"
                 f"当前Query: {clean_query}\n"
+                f"候选池ItemTypeTags(JSON): {json.dumps(candidate_type_tags, ensure_ascii=False)}\n"
                 f"相关历史记录(JSON): {json.dumps(history_for_prompt, ensure_ascii=False)}"
             )
         else:
             prompt = (
                 "你是电商推荐系统中的实时偏好建模专家（Agent4）。\n"
-                "任务：当前没有可用query。请仅根据用户相关历史正负行为，推理用户此刻偏好。\n"
+                "任务：当前没有可用query。请仅根据用户相关历史正负行为，按时间顺序推理用户此刻偏好，并预测用户下一次最可能购买什么。\n"
                 "要求：\n"
                 "1) 不要假设额外query意图，不要引用不存在的query信息。\n"
                 "2) 明确区分 Must_Have / Nice_to_Have / Must_Avoid。\n"
                 "3) 若历史中存在可分析的视觉信息（如 visual_tags/图片衍生描述），Nice_to_Have 必须包含视觉偏好结论；若无可分析视觉信息，则不要引用或臆造不存在的视觉信息。\n"
-                "4) 必须结合 history 中 positive 与 negative 的对比证据。\n"
-                "5) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
-                f"6) {guardrail_block}\n"
-                "7) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Reasoning(字符串)。\n\n"
+                "4) history 已按 timestamp 升序给出：positive 需要按时间顺序分析演化偏好与已购买轨迹；negative 样本通常无可靠时序，不要按其时间先后推理。\n"
+                "5) 必须结合 history 中 positive 与 negative 的对比证据。\n"
+                "6) Must_Have 可为空（若无法确定硬约束，不要强行填写）。\n"
+                "7) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
+                "8) 结合候选池 item type tags，输出 Predicted_Next_Items（数组，严格 5 条），每条含 item_type/likelihood/evidence；likelihood 只能是 Most_Likely/Secondary/Possible。\n"
+                f"9) {guardrail_block}\n"
+                "10) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Predicted_Next_Items(数组), Reasoning(字符串)。\n\n"
+                f"候选池ItemTypeTags(JSON): {json.dumps(candidate_type_tags, ensure_ascii=False)}\n"
                 f"相关历史记录(JSON): {json.dumps(history_for_prompt, ensure_ascii=False)}"
             )
 
@@ -186,10 +230,57 @@ class Qwen3DynamicReasonerLLM:
                 vals = [vals]
             return [str(x).strip() for x in vals if str(x).strip()]
 
+        raw_preds = payload.get("Predicted_Next_Items", [])
+        if not isinstance(raw_preds, list):
+            raw_preds = []
+
+        normalized_preds: List[Dict[str, str]] = []
+        for row in raw_preds:
+            if not isinstance(row, dict):
+                continue
+            item_type = str(row.get("item_type", "")).strip()
+            likelihood = str(row.get("likelihood", "Possible")).strip()
+            evidence = str(row.get("evidence", "")).strip()
+            if likelihood not in {"Most_Likely", "Secondary", "Possible"}:
+                likelihood = "Possible"
+            if not item_type:
+                continue
+            normalized_preds.append(
+                {
+                    "item_type": item_type,
+                    "likelihood": likelihood,
+                    "evidence": evidence,
+                }
+            )
+
+        if not normalized_preds:
+            fallback_tags = candidate_type_tags[:5]
+            default_likelihoods = ["Most_Likely", "Most_Likely", "Secondary", "Possible", "Possible"]
+            for idx, t in enumerate(fallback_tags):
+                normalized_preds.append(
+                    {
+                        "item_type": t,
+                        "likelihood": default_likelihoods[min(idx, len(default_likelihoods) - 1)],
+                        "evidence": "fallback_from_candidate_pool",
+                    }
+                )
+
+        normalized_preds = normalized_preds[:5]
+        while len(normalized_preds) < 5 and candidate_type_tags:
+            fill = candidate_type_tags[len(normalized_preds) % len(candidate_type_tags)]
+            normalized_preds.append(
+                {
+                    "item_type": fill,
+                    "likelihood": "Possible",
+                    "evidence": "auto_fill_to_5",
+                }
+            )
+
         return PreferenceConstraints(
             must_have=_normalize_list("Must_Have"),
             nice_to_have=_normalize_list("Nice_to_Have"),
             must_avoid=_normalize_list("Must_Avoid"),
+            next_item_predictions=normalized_preds,
             reasoning=str(payload.get("Reasoning", f"LLM raw output: {content[:800]}")),
         )
 
@@ -200,8 +291,8 @@ class DynamicPreferenceReasonerAgent:
     def __init__(self, llm: Qwen3DynamicReasonerLLM) -> None:
         self.llm = llm
 
-    def run(self, query: str, query_relevant_history: List[Dict[str, Any]]) -> PreferenceConstraints:
-        return self.llm.infer_constraints(query=query, history_rows=query_relevant_history)
+    def run(self, query: str, query_relevant_history: List[Dict[str, Any]], candidate_type_tags: List[str]) -> PreferenceConstraints:
+        return self.llm.infer_constraints(query=query, history_rows=query_relevant_history, candidate_type_tags=candidate_type_tags)
 
 
 class RankingScoringAgent:
@@ -230,6 +321,7 @@ def run_module3(
     model_name: str = "Qwen/Qwen3-8B",
     top_n: int = 20,
     disable_must_avoid: bool = False,
+    disable_must_have: bool = False,
     save_output: bool = True,
     output_dir: str | Path = "./processed/dynamic_reasoning_ranking_outputs",
 ) -> Module3Output:
@@ -243,9 +335,16 @@ def run_module3(
     reasoner = DynamicPreferenceReasonerAgent(
         llm=Qwen3DynamicReasonerLLM(model_name=model_name)
     )
-    constraints = reasoner.run(query=query, query_relevant_history=history_rows)
+    candidate_type_tags = _extract_candidate_item_type_tags(candidate_items)
+    constraints = reasoner.run(
+        query=query,
+        query_relevant_history=history_rows,
+        candidate_type_tags=candidate_type_tags,
+    )
     if disable_must_avoid:
         constraints.must_avoid = []
+    if disable_must_have:
+        constraints.must_have = []
 
     ranker = RankingScoringAgent(reranker=LLMItemReranker(model_name=model_name))
     ranked_items = ranker.run(
@@ -281,6 +380,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--output-dir", default="./processed/dynamic_reasoning_ranking_outputs")
+    parser.add_argument("--disable-must-have", action="store_true")
     args = parser.parse_args()
 
     payload = json.loads(Path(args.agent3_output).read_text(encoding="utf-8"))
@@ -290,5 +390,6 @@ if __name__ == "__main__":
         top_n=args.top_n,
         output_dir=args.output_dir,
         save_output=True,
+        disable_must_have=bool(args.disable_must_have),
     )
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2, default=str))
