@@ -310,6 +310,52 @@ class Qwen3DynamicReasonerLLM:
 
         normalized_preds = final_preds
 
+        raw_preds = payload.get("Predicted_Next_Items", [])
+        if not isinstance(raw_preds, list):
+            raw_preds = []
+
+        normalized_preds: List[Dict[str, str]] = []
+        for row in raw_preds:
+            if not isinstance(row, dict):
+                continue
+            item_type = str(row.get("item_type", "")).strip()
+            likelihood = str(row.get("likelihood", "Possible")).strip()
+            evidence = str(row.get("evidence", "")).strip()
+            if likelihood not in {"Most_Likely", "Secondary", "Possible"}:
+                likelihood = "Possible"
+            if not item_type:
+                continue
+            normalized_preds.append(
+                {
+                    "item_type": item_type,
+                    "likelihood": likelihood,
+                    "evidence": evidence,
+                }
+            )
+
+        if not normalized_preds:
+            fallback_tags = candidate_type_tags[:5]
+            default_likelihoods = ["Most_Likely", "Most_Likely", "Secondary", "Possible", "Possible"]
+            for idx, t in enumerate(fallback_tags):
+                normalized_preds.append(
+                    {
+                        "item_type": t,
+                        "likelihood": default_likelihoods[min(idx, len(default_likelihoods) - 1)],
+                        "evidence": "fallback_from_candidate_pool",
+                    }
+                )
+
+        normalized_preds = normalized_preds[:5]
+        while len(normalized_preds) < 5 and candidate_type_tags:
+            fill = candidate_type_tags[len(normalized_preds) % len(candidate_type_tags)]
+            normalized_preds.append(
+                {
+                    "item_type": fill,
+                    "likelihood": "Possible",
+                    "evidence": "auto_fill_to_5",
+                }
+            )
+
         return PreferenceConstraints(
             must_have=_normalize_list("Must_Have"),
             nice_to_have=_normalize_list("Nice_to_Have"),
