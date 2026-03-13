@@ -11,7 +11,7 @@ using product structured profile from module-1 and dynamic constraints from modu
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import torch
@@ -20,6 +20,31 @@ except Exception:  # pragma: no cover
     torch = None
     AutoModelForCausalLM = None
     AutoTokenizer = None
+
+
+def _normalize_prediction_text(v: Any) -> str:
+    return " ".join(str(v).strip().lower().split())
+
+
+def _collect_prediction_targets(preference_constraints: Dict[str, Any]) -> List[Tuple[str, float]]:
+    preds = preference_constraints.get("Predicted_Next_Items", [])
+    if not isinstance(preds, list):
+        return []
+
+    weight_map = {
+        "Most_Likely": 1.0,
+        "Secondary": 0.6,
+        "Possible": 0.3,
+    }
+    out: List[Tuple[str, float]] = []
+    for row in preds:
+        if not isinstance(row, dict):
+            continue
+        token = _normalize_prediction_text(row.get("item_type", ""))
+        likelihood = str(row.get("likelihood", "Possible")).strip()
+        if token:
+            out.append((token, weight_map.get(likelihood, 0.3)))
+    return out
 
 
 class LLMItemReranker:
@@ -115,9 +140,12 @@ class LLMItemReranker:
             "overall_confidence": profile.get("overall_confidence", 0.0),
         }
 
+        next_predictions = preference_constraints.get("Predicted_Next_Items", [])
+
         return (
             "你是电商推荐精排专家（Agent5）。请从用户视角判断候选商品与当下偏好的匹配程度。\n"
             "评分规则（只能取1~5）：\n"
+            "注意：这是 next-item 预测场景，需重点判断该候选是否与 Predicted_Next_Items 一致。\n"
             "1=触碰Must_Avoid或与核心诉求明显冲突；\n"
             "2=弱相关，仅少量满足；\n"
             "3=中等相关，满足部分Must_Have或多个Nice_to_Have；\n"
@@ -128,6 +156,7 @@ class LLMItemReranker:
             f"Must_Have: {json.dumps(must_have, ensure_ascii=False)}\n"
             f"Nice_to_Have: {json.dumps(nice_to_have, ensure_ascii=False)}\n"
             f"Must_Avoid: {json.dumps(must_avoid, ensure_ascii=False)}\n"
+            f"Predicted_Next_Items: {json.dumps(next_predictions, ensure_ascii=False)}\n"
             f"候选商品画像: {json.dumps(compact_item, ensure_ascii=False)}\n"
         )
 
@@ -148,6 +177,31 @@ class LLMItemReranker:
         item_text = "\n".join(str(x) for x in haystacks).lower()
         return any(token and token in item_text for token in must_avoid)
 
+
+
+    @staticmethod
+    def _prediction_alignment_bonus(preference_constraints: Dict[str, Any], item: Dict[str, Any]) -> float:
+        targets = _collect_prediction_targets(preference_constraints)
+        if not targets:
+            return 0.0
+
+        profile = item.get("profile", {})
+        haystacks = [
+            profile.get("title", ""),
+            json.dumps(profile.get("taxonomy", {}), ensure_ascii=False),
+            json.dumps(profile.get("text_tags", {}), ensure_ascii=False),
+            json.dumps(profile.get("visual_tags", {}), ensure_ascii=False),
+            json.dumps(profile.get("hypotheses", []), ensure_ascii=False),
+        ]
+        item_text = _normalize_prediction_text("\n".join(str(x) for x in haystacks))
+
+        bonus = 0.0
+        for token, weight in targets:
+            if token in item_text:
+                bonus += weight
+        return min(1.5, bonus)
+
+
     def rerank_items(
         self,
         query: str,
@@ -166,8 +220,11 @@ class LLMItemReranker:
 
             prompt = self._build_scoring_prompt(query, preference_constraints, item)
             score_info = self._score_with_logits(prompt)
+            prediction_bonus = self._prediction_alignment_bonus(preference_constraints, item)
             enriched = dict(item)
-            enriched["ranking_score"] = score_info["weighted_score"]
+            enriched["llm_weighted_score"] = score_info["weighted_score"]
+            enriched["prediction_bonus"] = prediction_bonus
+            enriched["ranking_score"] = float(score_info["weighted_score"] + prediction_bonus)
             enriched["score_probs"] = score_info["probs"]
             scored.append(enriched)
 

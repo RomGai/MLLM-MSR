@@ -117,6 +117,44 @@ def _user_seen_items(user_pairs_tsv: str | Path, user_id: str) -> Set[str]:
     return seen
 
 
+def _latest_positive_by_timestamp(
+    user_pairs_tsv: str | Path,
+    user_id: str,
+    positive_item_ids: Sequence[str],
+) -> str:
+    """Pick the latest (max timestamp) positive item for the user.
+
+    Falls back to the first positive item when no valid timestamp can be found.
+    """
+    if not positive_item_ids:
+        raise ValueError(f"No positive items for user={user_id}")
+
+    target_set = {str(i).strip() for i in positive_item_ids if str(i).strip()}
+    if not target_set:
+        return str(positive_item_ids[0]).strip()
+
+    latest_item = None
+    latest_ts = None
+    with Path(user_pairs_tsv).open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            if str(row.get("user_id", "")).strip() != str(user_id):
+                continue
+            item_id = str(row.get("item_id", "")).strip()
+            if item_id not in target_set:
+                continue
+            ts_raw = str(row.get("timestamp", "")).strip()
+            try:
+                ts_val = int(ts_raw)
+            except (TypeError, ValueError):
+                continue
+            if latest_ts is None or ts_val > latest_ts:
+                latest_ts = ts_val
+                latest_item = item_id
+
+    return latest_item or str(positive_item_ids[0]).strip()
+
+
 def _build_eval21_catalog(
     all_item_ids: Sequence[str],
     unit: EvalUnit,
@@ -382,6 +420,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--target-user-id", default="")
     parser.add_argument("--target-user-row-index", type=int, default=0)
     parser.add_argument("--positive-index", type=int, default=0)
+    parser.add_argument(
+        "--positive-selection",
+        choices=["latest", "index"],
+        default="latest",
+        help="How to choose the 1 positive sample from eval row positives.",
+    )
     parser.add_argument("--max-users", type=int, default=0, help="0 means all selected users")
     parser.add_argument("--exclude-seen-for-negatives", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
@@ -432,6 +476,12 @@ def build_argparser() -> argparse.ArgumentParser:
         default=bool(full_defaults["positive_history_only"]),
         help="Use only positive history rows in Agent2/Agent3 and ignore Must_Avoid constraints in Agent5.",
     )
+    parser.add_argument(
+        "--disable-must-have",
+        action="store_true",
+        default=bool(full_defaults.get("disable_must_have", False)),
+        help="Disable Agent4 Must_Have constraints before Agent5 scoring.",
+    )
     return parser
 
 
@@ -467,11 +517,18 @@ def main(args: argparse.Namespace) -> None:
 
     total = len(units)
     for idx, unit in enumerate(units, start=1):
-        if args.positive_index < 0 or args.positive_index >= len(unit.pos_items):
-            raise IndexError(
-                f"positive-index={args.positive_index} out of range for user={unit.user_id}, pos size={len(unit.pos_items)}"
+        if str(args.positive_selection) == "latest":
+            selected_positive = _latest_positive_by_timestamp(
+                user_pairs_tsv=args.user_pairs_tsv,
+                user_id=unit.user_id,
+                positive_item_ids=unit.pos_items,
             )
-        selected_positive = unit.pos_items[args.positive_index]
+        else:
+            if args.positive_index < 0 or args.positive_index >= len(unit.pos_items):
+                raise IndexError(
+                    f"positive-index={args.positive_index} out of range for user={unit.user_id}, pos size={len(unit.pos_items)}"
+                )
+            selected_positive = unit.pos_items[args.positive_index]
         if selected_positive not in item_map:
             raise KeyError(f"positive item {selected_positive} missing in item-desc-tsv")
 
@@ -539,6 +596,7 @@ def main(args: argparse.Namespace) -> None:
             max_history_rows=int(args.max_history_rows),
             top_n=int(args.top_n),
             positive_history_only=bool(args.positive_history_only),
+            disable_must_have=bool(args.disable_must_have),
             filter_candidates_by_item_type=not bool(args.disable_agent3_item_type_filter),
             candidate_item_ids_scope=list(eval21_items),
         )
