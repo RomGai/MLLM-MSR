@@ -389,7 +389,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--min-candidate-items", type=int, default=20)
     parser.add_argument("--max-candidate-items", type=int, default=200)
     parser.add_argument("--max-history-rows", type=int, default=200)
-    parser.add_argument("--top-n", type=int, default=20)
+    parser.add_argument("--top-n", type=int, default=21)
     parser.add_argument(
         "--disable-agent3-item-type-filter",
         action="store_true",
