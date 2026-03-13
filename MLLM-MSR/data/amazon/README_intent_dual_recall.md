@@ -161,6 +161,7 @@ python run_full_agents_pipeline_eval21.py \
 - 正样本默认使用 `--positive-selection latest`：从该用户正样本集合中按 `Video_Games_u_i_pairs.tsv` 的时间戳选择“最晚一次交互”的 item。
 - 若想回退旧行为，可改用 `--positive-selection index --positive-index N`。
 - 若你希望 next-item 预测更开放（避免硬约束过强），可加 `--disable-must-have`，使 Agent5 不使用 Must_Have 作为强约束。
+- 若你希望暂时关闭预测加分影响，可加 `--disable-prediction-bonus`，使 Agent5 仅按 logits 加权分排序。
 - 脚本按用户循环处理；每处理完一个 user 会实时打印当前累计指标（AUC / Recall@K / MRR@K / NDCG@K），指标公式与 `test_with_llava.py` 保持一致的分组口径。
 
 

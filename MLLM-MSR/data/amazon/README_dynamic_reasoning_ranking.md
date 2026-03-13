@@ -16,7 +16,7 @@
   - `Must_Have`
   - `Nice_to_Have`（若有可分析视觉信息则必须包含视觉偏好结论；若无则不得臆造）
   - `Must_Avoid`
-  - `Predicted_Next_Items`（严格 5 个预测，字段含 `item_type` / `likelihood` / `evidence`）
+  - `Predicted_Next_Items`（严格 3 个预测，字段含 `item_type` / `likelihood` / `evidence`，且 likelihood 分别为 Most_Likely / Secondary / Possible）
   - `Reasoning`
 
 LLM 调用方式与 Agent3 一致：`Qwen/Qwen3-8B + apply_chat_template(enable_thinking=True)`。
@@ -42,6 +42,8 @@ LLM 调用方式与 Agent3 一致：`Qwen/Qwen3-8B + apply_chat_template(enable_
 6. 依分数降序排序并输出 Top-N。
 
 > 该机制与原 `reranker.py` 中“五档打分 + logits 加权”保持一致，只是改为纯文本 LLM。
+
+可选：传入 `--disable-prediction-bonus` 可关闭预测加分，仅保留 logits 加权分。
 
 ## 一体化调用
 

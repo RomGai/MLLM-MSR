@@ -482,6 +482,12 @@ def build_argparser() -> argparse.ArgumentParser:
         default=bool(full_defaults.get("disable_must_have", False)),
         help="Disable Agent4 Must_Have constraints before Agent5 scoring.",
     )
+    parser.add_argument(
+        "--disable-prediction-bonus",
+        action="store_true",
+        default=bool(full_defaults.get("disable_prediction_bonus", False)),
+        help="Disable Agent5 prediction bonus and use logits-weighted score only.",
+    )
     return parser
 
 
@@ -597,6 +603,7 @@ def main(args: argparse.Namespace) -> None:
             top_n=int(args.top_n),
             positive_history_only=bool(args.positive_history_only),
             disable_must_have=bool(args.disable_must_have),
+            disable_prediction_bonus=bool(args.disable_prediction_bonus),
             filter_candidates_by_item_type=not bool(args.disable_agent3_item_type_filter),
             candidate_item_ids_scope=list(eval21_items),
         )

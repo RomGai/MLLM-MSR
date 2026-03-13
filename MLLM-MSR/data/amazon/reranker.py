@@ -208,6 +208,7 @@ class LLMItemReranker:
         preference_constraints: Dict[str, Any],
         candidate_items: List[Dict[str, Any]],
         top_n: int = 20,
+        disable_prediction_bonus: bool = False,
     ) -> List[Dict[str, Any]]:
         self.load()
         if top_n <= 0:
@@ -220,7 +221,7 @@ class LLMItemReranker:
 
             prompt = self._build_scoring_prompt(query, preference_constraints, item)
             score_info = self._score_with_logits(prompt)
-            prediction_bonus = self._prediction_alignment_bonus(preference_constraints, item)
+            prediction_bonus = 0.0 if disable_prediction_bonus else self._prediction_alignment_bonus(preference_constraints, item)
             enriched = dict(item)
             enriched["llm_weighted_score"] = score_info["weighted_score"]
             enriched["prediction_bonus"] = prediction_bonus
@@ -251,6 +252,7 @@ if __name__ == "__main__":
     parser.add_argument("input_json", help="JSON containing query/preference_constraints/candidate_items")
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
+    parser.add_argument("--disable-prediction-bonus", action="store_true")
     args = parser.parse_args()
 
     payload = json.loads(Path(args.input_json).read_text(encoding="utf-8"))
@@ -260,5 +262,6 @@ if __name__ == "__main__":
         preference_constraints=dict(payload.get("preference_constraints", {})),
         candidate_items=list(payload.get("candidate_items", [])),
         top_n=args.top_n,
+        disable_prediction_bonus=bool(args.disable_prediction_bonus),
     )
     print(json.dumps(results, ensure_ascii=False, indent=2, default=str))

@@ -337,6 +337,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             top_n=args.top_n,
             disable_must_avoid=bool(getattr(args, "positive_history_only", False)),
             disable_must_have=bool(getattr(args, "disable_must_have", False)),
+            disable_prediction_bonus=bool(getattr(args, "disable_prediction_bonus", False)),
             save_output=True,
             output_dir=args.dynamic_output_dir,
         )
@@ -403,6 +404,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--disable-must-have",
         action="store_true",
         help="Disable Agent4 Must_Have constraints before Agent5 scoring.",
+    )
+    parser.add_argument(
+        "--disable-prediction-bonus",
+        action="store_true",
+        help="Disable Agent5 prediction bonus and use logits-weighted score only.",
     )
     return parser
 
