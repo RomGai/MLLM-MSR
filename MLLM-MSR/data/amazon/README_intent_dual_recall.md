@@ -149,7 +149,7 @@ python run_full_agents_pipeline_eval21.py \
   --eval-user-items-negs-tsv ./processed/Video_Games_user_items_negs_test.csv \
   --agent2-user-items-negs-tsv ./processed/Video_Games_user_items_negs.tsv \
   --target-user-id 23 \
-  --positive-index 0 \
+  --positive-selection latest \
   --exclude-seen-for-negatives \
   --bundle-output ./processed/full_pipeline_eval21_bundle.zip
 ```
@@ -158,6 +158,10 @@ python run_full_agents_pipeline_eval21.py \
 - `--eval-user-items-negs-tsv` 用于挑选“评测单元”（用户 + 正样本 + 负样本来源）。
 - 若该文件负样本不足 20，脚本会从全商品池中按随机种子补齐到 20（可选排除该用户历史看过商品）。
 - 最终确保 Agent 1 的商品输入恰好 21 个 item。
+- 正样本默认使用 `--positive-selection latest`：从该用户正样本集合中按 `Video_Games_u_i_pairs.tsv` 的时间戳选择“最晚一次交互”的 item。
+- 若想回退旧行为，可改用 `--positive-selection index --positive-index N`。
+- 若你希望 next-item 预测更开放（避免硬约束过强），可加 `--disable-must-have`，使 Agent5 不使用 Must_Have 作为强约束。
+- 若你希望暂时关闭预测加分影响，可加 `--disable-prediction-bonus`，使 Agent5 仅按 logits 加权分排序。
 - 脚本按用户循环处理；每处理完一个 user 会实时打印当前累计指标（AUC / Recall@K / MRR@K / NDCG@K），指标公式与 `test_with_llava.py` 保持一致的分组口径。
 
 
