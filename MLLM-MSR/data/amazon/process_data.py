@@ -48,6 +48,9 @@ else:
 
 
 RND_SEED = 2024040331
+DEFAULT_CORE_REQ = (5, 5)
+DEFAULT_POS_NUM = 21
+DEFAULT_NEG_NUM = 5
 
 REVIEWS_JSONL_COLS = ['user_id', 'parent_asin', 'timestamp']
 META_JSONL_COLS = ['parent_asin', 'image', 'title', 'summary']
@@ -197,7 +200,7 @@ def save_reviews_to_csv(dataset, df, u_map, i_map):
     
     # save user item negs
     pos_neg_path = os.path.join(OUT_PATH, POS_NEG_FILE.format(dataset=dataset))
-    df2 = user_items_negs(df, pos=11, neg=5)
+    df2 = user_items_negs(df, pos=DEFAULT_POS_NUM, neg=DEFAULT_NEG_NUM)
     df2.to_csv(pos_neg_path, sep='\t', index=False)
     print(f"saved file {pos_neg_path}")
     
@@ -249,7 +252,7 @@ def process_dataset(dataset, core_req):
     i_map = process_reviews(dataset, core_req)[-1]
     process_meta(i_map, dataset)
 
-# process_dataset(MAGAZINE_DATASET, (3,3))
-# process_dataset('Baby_Products', (6,5))
-process_dataset('Video_Games', (6,5))
-# process_dataset('Sports_and_Outdoors', (6,5))
+# process_dataset(MAGAZINE_DATASET, DEFAULT_CORE_REQ)
+# process_dataset('Baby_Products', DEFAULT_CORE_REQ)
+process_dataset('Video_Games', DEFAULT_CORE_REQ)
+# process_dataset('Sports_and_Outdoors', DEFAULT_CORE_REQ)
