@@ -30,7 +30,7 @@ class PreferenceConstraints:
     must_have: List[str]
     nice_to_have: List[str]
     must_avoid: List[str]
-    next_item_predictions: List[Dict[str, str]]
+    next_item_predictions: List[str]
     reasoning: str
 
     def to_dict(self) -> Dict[str, Any]:
@@ -195,7 +195,7 @@ class Qwen3DynamicReasonerLLM:
                 "4) 必须结合 history 中 positive 与 negative 的对比证据。\n"
                 "5) Must_Have 可为空（若无法确定硬约束，不要强行填写）。\n"
                 "6) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
-                "7) 结合候选池 item type tags，输出 Predicted_Next_Items（数组，严格 3 条），每条含 item_type/likelihood/evidence；3 条的 likelihood 必须分别是 Most_Likely、Secondary、Possible（各一次）。\n"
+                "7) 结合候选池 item type tags，输出 Predicted_Next_Items（数组，严格 3 条），每条是 item_type 字符串。\n"
                 "8) Must_Have/Nice_to_Have/Must_Avoid 的每个元素都必须是简短自然语言偏好短语（如“Nintendo Switch 兼容性”“无线/蓝牙连接”），禁止输出 JSON/字典/键值对/引号包裹的结构化片段。\n"
                 f"10) {guardrail_block}\n"
                 "11) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Predicted_Next_Items(数组), Reasoning(字符串)。\n\n"
@@ -215,7 +215,7 @@ class Qwen3DynamicReasonerLLM:
                 "5) 必须结合 history 中 positive 与 negative 的对比证据。\n"
                 "6) Must_Have 可为空（若无法确定硬约束，不要强行填写）。\n"
                 "7) 先决条件必须优先于一般偏好，禁止输出与先决条件冲突的结论。\n"
-                "8) 结合候选池 item type tags，输出 Predicted_Next_Items（数组，严格 3 条），每条含 item_type/likelihood/evidence；3 条的 likelihood 必须分别是 Most_Likely、Secondary、Possible（各一次）。\n"
+                "8) 结合候选池 item type tags，输出 Predicted_Next_Items（数组，严格 3 条），每条是 item_type 字符串。\n"
                 "9) Must_Have/Nice_to_Have/Must_Avoid 的每个元素都必须是简短自然语言偏好短语（如“Nintendo Switch 兼容性”“无线/蓝牙连接”），禁止输出 JSON/字典/键值对/引号包裹的结构化片段。\n"
                 f"10) {guardrail_block}\n"
                 "11) 输出严格 JSON 对象，字段：Must_Have(数组), Nice_to_Have(数组), Must_Avoid(数组), Predicted_Next_Items(数组), Reasoning(字符串)。\n\n"
@@ -257,104 +257,27 @@ class Qwen3DynamicReasonerLLM:
         if not isinstance(raw_preds, list):
             raw_preds = []
 
-        normalized_preds: List[Dict[str, str]] = []
+        normalized_preds: List[str] = []
+        seen_pred_types = set()
         for row in raw_preds:
-            if not isinstance(row, dict):
+            item_type = ""
+            if isinstance(row, str):
+                item_type = str(row).strip()
+            elif isinstance(row, dict):
+                item_type = str(row.get("item_type", "")).strip()
+            if not item_type or item_type in seen_pred_types:
                 continue
-            item_type = str(row.get("item_type", "")).strip()
-            likelihood = str(row.get("likelihood", "Possible")).strip()
-            evidence = str(row.get("evidence", "")).strip()
-            if likelihood not in {"Most_Likely", "Secondary", "Possible"}:
-                likelihood = "Possible"
-            if not item_type:
-                continue
-            normalized_preds.append(
-                {
-                    "item_type": item_type,
-                    "likelihood": likelihood,
-                    "evidence": evidence,
-                }
-            )
+            seen_pred_types.add(item_type)
+            normalized_preds.append(item_type)
 
-        # enforce exactly 3 with one label each: Most_Likely, Secondary, Possible
-        by_label: Dict[str, Dict[str, str]] = {}
-        for row in normalized_preds:
-            lbl = row["likelihood"]
-            if lbl not in by_label:
-                by_label[lbl] = row
+        for t in candidate_type_tags:
+            if len(normalized_preds) >= 3:
+                break
+            if t and t not in seen_pred_types:
+                seen_pred_types.add(t)
+                normalized_preds.append(t)
 
-        ordered_labels = ["Most_Likely", "Secondary", "Possible"]
-        final_preds: List[Dict[str, str]] = []
-        used_types = set()
-        for lbl in ordered_labels:
-            cand = by_label.get(lbl)
-            if cand and cand["item_type"] not in used_types:
-                final_preds.append(cand)
-                used_types.add(cand["item_type"])
-                continue
-            fill_type = ""
-            for t in candidate_type_tags:
-                if t not in used_types:
-                    fill_type = t
-                    break
-            if not fill_type and candidate_type_tags:
-                fill_type = candidate_type_tags[0]
-            final_preds.append(
-                {
-                    "item_type": fill_type or "Unknown Item Type",
-                    "likelihood": lbl,
-                    "evidence": "fallback_from_candidate_pool",
-                }
-            )
-            used_types.add(fill_type or "Unknown Item Type")
-
-        normalized_preds = final_preds
-
-        raw_preds = payload.get("Predicted_Next_Items", [])
-        if not isinstance(raw_preds, list):
-            raw_preds = []
-
-        normalized_preds: List[Dict[str, str]] = []
-        for row in raw_preds:
-            if not isinstance(row, dict):
-                continue
-            item_type = str(row.get("item_type", "")).strip()
-            likelihood = str(row.get("likelihood", "Possible")).strip()
-            evidence = str(row.get("evidence", "")).strip()
-            if likelihood not in {"Most_Likely", "Secondary", "Possible"}:
-                likelihood = "Possible"
-            if not item_type:
-                continue
-            normalized_preds.append(
-                {
-                    "item_type": item_type,
-                    "likelihood": likelihood,
-                    "evidence": evidence,
-                }
-            )
-
-        if not normalized_preds:
-            fallback_tags = candidate_type_tags[:5]
-            default_likelihoods = ["Most_Likely", "Most_Likely", "Secondary", "Possible", "Possible"]
-            for idx, t in enumerate(fallback_tags):
-                normalized_preds.append(
-                    {
-                        "item_type": t,
-                        "likelihood": default_likelihoods[min(idx, len(default_likelihoods) - 1)],
-                        "evidence": "fallback_from_candidate_pool",
-                    }
-                )
-
-        normalized_preds = normalized_preds[:5]
-        while len(normalized_preds) < 5 and candidate_type_tags:
-            fill = candidate_type_tags[len(normalized_preds) % len(candidate_type_tags)]
-            normalized_preds.append(
-                {
-                    "item_type": fill,
-                    "likelihood": "Possible",
-                    "evidence": "auto_fill_to_5",
-                }
-            )
+        normalized_preds = normalized_preds[:3]
 
         return PreferenceConstraints(
             must_have=_normalize_list("Must_Have"),
@@ -376,7 +299,7 @@ class DynamicPreferenceReasonerAgent:
 
 
 class RankingScoringAgent:
-    """Agent 5: rank candidate items with five-level logits weighting."""
+    """Agent 5: rank candidate items with yes/no logits scoring."""
 
     def __init__(self, reranker: LLMItemReranker) -> None:
         self.reranker = reranker
