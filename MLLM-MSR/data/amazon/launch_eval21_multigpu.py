@@ -18,6 +18,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
+import time
 
 
 @dataclass
@@ -26,6 +27,32 @@ class Shard:
     gpu_id: str
     start_user_index: int
     max_users: int
+
+
+@dataclass
+class DistEnv:
+    world_size: int
+    rank: int
+    local_rank: int
+
+
+def _read_int_env(keys: List[str], default: int) -> int:
+    for k in keys:
+        v = os.environ.get(k)
+        if v is None or str(v).strip() == "":
+            continue
+        try:
+            return int(v)
+        except ValueError:
+            continue
+    return default
+
+
+def _get_dist_env() -> DistEnv:
+    world_size = _read_int_env(["WORLD_SIZE", "SLURM_NTASKS", "OMPI_COMM_WORLD_SIZE"], 1)
+    rank = _read_int_env(["RANK", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK"], 0)
+    local_rank = _read_int_env(["LOCAL_RANK", "SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK"], rank)
+    return DistEnv(world_size=world_size, rank=rank, local_rank=local_rank)
 
 
 def _make_shards(total_users: int, gpu_ids: List[str]) -> List[Shard]:
@@ -101,9 +128,29 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_dist_gpu_id(dist: DistEnv, shard_gpu_id: str, gpu_ids: List[str]) -> str:
+    """Choose GPU id passed to shard wrapper in distributed launch.
+
+    - If launcher already masks each rank to a single GPU via CUDA_VISIBLE_DEVICES,
+      pass "0" to stay inside that one visible device.
+    - Otherwise prefer local-rank based mapping when possible.
+    - Fallback to shard-assigned gpu id.
+    """
+    cvd = str(os.environ.get("CUDA_VISIBLE_DEVICES", "")).strip()
+    if cvd:
+        visible = [x.strip() for x in cvd.split(",") if x.strip()]
+        if len(visible) == 1:
+            return "0"
+
+    if 0 <= dist.local_rank < len(gpu_ids):
+        return gpu_ids[dist.local_rank]
+    return shard_gpu_id
+
+
 def main(args: argparse.Namespace) -> None:
     gpu_ids = [x.strip() for x in str(args.gpu_ids).split(",") if x.strip()]
     shards = _make_shards(int(args.total_users), gpu_ids)
+    dist = _get_dist_env()
 
     eval_run_root = Path(args.eval_run_root).resolve()
     eval_run_root.mkdir(parents=True, exist_ok=True)
@@ -120,13 +167,7 @@ def main(args: argparse.Namespace) -> None:
     if not isinstance(extra_args, list):
         raise ValueError("extra-args-json must be a JSON array")
 
-    procs = []
-    for shard in shards:
-        shard_root = eval_run_root / f"shard_{shard.shard_id}"
-        shard_root.mkdir(parents=True, exist_ok=True)
-
-        shard_bundle = shard_root / "shard_bundle.zip"
-
+    def build_shard_cmd(shard: Shard, shard_root: Path, shard_bundle: Path) -> List[str]:
         shared_global_db_path = str(args.shared_global_db_path).strip()
         if shared_global_db_path:
             global_db = shared_global_db_path
@@ -139,12 +180,7 @@ def main(args: argparse.Namespace) -> None:
         else:
             history_db = str(shard_root / f"history_gpu{shard.gpu_id}.db")
 
-        log_path = shard_root / "launcher.log"
-        err_path = shard_root / "launcher.err"
-        lf = log_path.open("w", encoding="utf-8")
-        ef = err_path.open("w", encoding="utf-8")
-
-        cmd = [
+        return [
             str(Path(args.sh_script).resolve()),
             str(Path(args.python_bin).resolve()),
             str(Path(args.eval_script).resolve()),
@@ -157,6 +193,132 @@ def main(args: argparse.Namespace) -> None:
             history_db,
             json.dumps(extra_args, ensure_ascii=False),
         ]
+
+    if dist.world_size > 1:
+        if dist.rank >= len(shards):
+            print(
+                f"[dist] rank={dist.rank} world_size={dist.world_size} has no shard assigned "
+                f"(shards={len(shards)}), exiting."
+            )
+            return
+
+        shard = shards[dist.rank]
+        shard_root = eval_run_root / f"shard_{shard.shard_id}"
+        shard_root.mkdir(parents=True, exist_ok=True)
+        shard_bundle = shard_root / "shard_bundle.zip"
+
+        launch_gpu_id = _resolve_dist_gpu_id(dist, shard.gpu_id, gpu_ids)
+        cmd = build_shard_cmd(
+            Shard(
+                shard_id=shard.shard_id,
+                gpu_id=launch_gpu_id,
+                start_user_index=shard.start_user_index,
+                max_users=shard.max_users,
+            ),
+            shard_root,
+            shard_bundle,
+        )
+        log_path = shard_root / f"launcher_rank{dist.rank}.log"
+        err_path = shard_root / f"launcher_rank{dist.rank}.err"
+        status_dir = eval_run_root / "_dist_status"
+        status_dir.mkdir(parents=True, exist_ok=True)
+        status_path = status_dir / f"rank_{dist.rank}.json"
+
+        print(
+            f"[dist-launch] rank={dist.rank}/{dist.world_size} local_rank={dist.local_rank} "
+            f"-> shard={shard.shard_id} gpu={launch_gpu_id} start={cmd[4]} max={shard.max_users}"
+        )
+        with log_path.open("w", encoding="utf-8") as lf, err_path.open("w", encoding="utf-8") as ef:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=ef, env=os.environ.copy())
+            ret = proc.wait()
+
+        status_path.write_text(
+            json.dumps(
+                {
+                    "rank": dist.rank,
+                    "world_size": dist.world_size,
+                    "ret": ret,
+                    "shard_id": shard.shard_id,
+                    "gpu_id": shard.gpu_id,
+                    "launch_gpu_id": launch_gpu_id,
+                    "log_path": str(log_path),
+                    "err_path": str(err_path),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        if dist.rank == 0:
+            print("[dist] rank0 waiting for all rank status files...")
+            timeout_s = 24 * 3600
+            start_ts = time.time()
+            expected = min(dist.world_size, len(shards))
+            while True:
+                present = list(status_dir.glob("rank_*.json"))
+                if len(present) >= expected:
+                    break
+                if time.time() - start_ts > timeout_s:
+                    raise RuntimeError("Timed out waiting for distributed shard completion")
+                time.sleep(2)
+
+            failed = []
+            for i in range(expected):
+                s = json.loads((status_dir / f"rank_{i}.json").read_text(encoding="utf-8"))
+                if int(s.get("ret", 1)) != 0:
+                    failed.append(s)
+
+            if failed:
+                print("\n[error] some distributed shards failed:")
+                for item in failed:
+                    print(
+                        f"- rank={item['rank']} shard={item['shard_id']} gpu={item['gpu_id']} ret={item['ret']}"
+                    )
+                    print("  --- stderr tail ---")
+                    print(_read_lines(Path(item["err_path"]), n=40))
+                    print("  --- stdout tail ---")
+                    print(_read_lines(Path(item["log_path"]), n=20))
+                raise SystemExit(1)
+
+            out_zip = _zip_dir(eval_run_root, final_bundle_output)
+            print(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "mode": "distributed",
+                        "eval_run_root": str(eval_run_root),
+                        "final_bundle_output": str(out_zip),
+                        "shards": [
+                            {
+                                "shard_id": s.shard_id,
+                                "gpu_id": s.gpu_id,
+                                "start_user_index": int(args.start_user_index) + s.start_user_index,
+                                "max_users": s.max_users,
+                            }
+                            for s in shards
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        elif ret != 0:
+            raise SystemExit(ret)
+        return
+
+    procs = []
+    for shard in shards:
+        shard_root = eval_run_root / f"shard_{shard.shard_id}"
+        shard_root.mkdir(parents=True, exist_ok=True)
+
+        shard_bundle = shard_root / "shard_bundle.zip"
+
+        log_path = shard_root / "launcher.log"
+        err_path = shard_root / "launcher.err"
+        lf = log_path.open("w", encoding="utf-8")
+        ef = err_path.open("w", encoding="utf-8")
+
+        cmd = build_shard_cmd(shard, shard_root, shard_bundle)
 
         print(f"[launch] shard={shard.shard_id} gpu={shard.gpu_id} start={cmd[4]} max={shard.max_users}")
         proc = subprocess.Popen(cmd, stdout=lf, stderr=ef, env=os.environ.copy())
