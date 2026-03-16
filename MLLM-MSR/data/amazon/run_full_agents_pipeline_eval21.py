@@ -1,8 +1,8 @@
-"""Run Amazon full agents pipeline with per-user eval21 item catalogs.
+"""Run Amazon full agents pipeline with per-user eval item catalogs.
 
 Key behavior:
-- For each evaluation user, build a 21-item catalog (1 positive + 20 negatives)
-  BEFORE Agent 1, and use it as Agent 1's full item input.
+- For each evaluation user, build a (1 positive + N negatives) catalog BEFORE
+  Agent 1, and use it as Agent 1's full item input.
 - Agent 2 keeps normal full-history processing.
 - After each user is processed, print cumulative metrics using the same grouped
   ranking metrics style as `test/microlens/test_with_llava.py`.
@@ -209,6 +209,14 @@ def _build_eval21_catalog(
 def _bundle_eval_run_root(eval_run_root: str | Path, bundle_output: str | Path) -> Path:
     root = Path(eval_run_root)
     bundle = Path(bundle_output)
+
+    # Allow passing either an explicit zip file path or a directory path.
+    if bundle.exists() and bundle.is_dir():
+        bundle = bundle / f"{root.name}.zip"
+    elif not bundle.exists() and bundle.suffix.lower() != ".zip":
+        bundle.mkdir(parents=True, exist_ok=True)
+        bundle = bundle / f"{root.name}.zip"
+
     bundle.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for child in root.rglob("*"):
@@ -396,7 +404,13 @@ def _write_eval21_scored_items(
         writer.writerows(records)
 
 
-def _pick_units(units: List[EvalUnit], target_user_id: str, target_user_row_index: int, max_users: int) -> List[EvalUnit]:
+def _pick_units(
+    units: List[EvalUnit],
+    target_user_id: str,
+    target_user_row_index: int,
+    max_users: int,
+    start_user_index: int,
+) -> List[EvalUnit]:
     if target_user_id:
         user_units = [u for u in units if u.user_id == target_user_id]
         if not user_units:
@@ -414,6 +428,12 @@ def _pick_units(units: List[EvalUnit], target_user_id: str, target_user_row_inde
                 continue
             seen.add(u.user_id)
             chosen.append(u)
+
+    start = max(0, int(start_user_index))
+    if start > 0:
+        if start >= len(chosen):
+            raise IndexError(f"start-user-index={start} out of range: {len(chosen)}")
+        chosen = chosen[start:]
 
     if max_users > 0:
         chosen = chosen[:max_users]
@@ -443,6 +463,7 @@ def build_argparser() -> argparse.ArgumentParser:
         help="How to choose the 1 positive sample from eval row positives.",
     )
     parser.add_argument("--max-users", type=int, default=0, help="0 means all selected users")
+    parser.add_argument("--start-user-index", type=int, default=0, help="Skip first N selected users")
     parser.add_argument("--exclude-seen-for-negatives", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
@@ -524,7 +545,13 @@ def main(args: argparse.Namespace) -> None:
     units_all = _read_user_items_negs(args.eval_user_items_negs_tsv)
     if not units_all:
         raise ValueError("No valid eval rows")
-    units = _pick_units(units_all, str(args.target_user_id), int(args.target_user_row_index), int(args.max_users))
+    units = _pick_units(
+        units_all,
+        str(args.target_user_id),
+        int(args.target_user_row_index),
+        int(args.max_users),
+        int(args.start_user_index),
+    )
 
     agent2_units_all = _read_user_items_negs(args.agent2_user_items_negs_tsv)
     if not agent2_units_all:
