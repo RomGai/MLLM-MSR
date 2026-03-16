@@ -1,8 +1,8 @@
 """LLM-based item reranker for Amazon recommendation (Qwen3-8B).
 
 This file implements Agent 5 compatible scoring:
-- 5-level relevance buckets (1~5)
-- logits-based weighted expectation score
+- yes/no relevance decision
+- yes/no logits-based score
 
 Compared with previous multimodal reranker, this version is pure text LLM,
 using product structured profile from module-1 and dynamic constraints from module-3.
@@ -31,24 +31,23 @@ def _collect_prediction_targets(preference_constraints: Dict[str, Any]) -> List[
     if not isinstance(preds, list):
         return []
 
-    weight_map = {
-        "Most_Likely": 1.0,
-        "Secondary": 0.6,
-        "Possible": 0.3,
-    }
     out: List[Tuple[str, float]] = []
     for row in preds:
+        if isinstance(row, str):
+            token = _normalize_prediction_text(row)
+            if token:
+                out.append((token, 1.0))
+            continue
         if not isinstance(row, dict):
             continue
         token = _normalize_prediction_text(row.get("item_type", ""))
-        likelihood = str(row.get("likelihood", "Possible")).strip()
         if token:
-            out.append((token, weight_map.get(likelihood, 0.3)))
+            out.append((token, 1.0))
     return out
 
 
 class LLMItemReranker:
-    """Rerank candidate items with Qwen3-8B via five-level logits weighting."""
+    """Rerank candidate items with Qwen3-8B via yes/no logits."""
 
     def __init__(
         self,
@@ -62,11 +61,8 @@ class LLMItemReranker:
         self._tokenizer = None
         self._model = None
 
-        self.id_1 = None
-        self.id_2 = None
-        self.id_3 = None
-        self.id_4 = None
-        self.id_5 = None
+        self.id_yes = None
+        self.id_no = None
 
     def load(self) -> None:
         if AutoTokenizer is None or AutoModelForCausalLM is None or torch is None:
@@ -81,11 +77,8 @@ class LLMItemReranker:
             device_map="auto",
         )
 
-        self.id_1 = self._tokenizer.convert_tokens_to_ids("1")
-        self.id_2 = self._tokenizer.convert_tokens_to_ids("2")
-        self.id_3 = self._tokenizer.convert_tokens_to_ids("3")
-        self.id_4 = self._tokenizer.convert_tokens_to_ids("4")
-        self.id_5 = self._tokenizer.convert_tokens_to_ids("5")
+        self.id_yes = self._tokenizer.convert_tokens_to_ids("yes")
+        self.id_no = self._tokenizer.convert_tokens_to_ids("no")
 
     @torch.no_grad()
     def _score_with_logits(self, prompt: str) -> Dict[str, Any]:
@@ -100,23 +93,14 @@ class LLMItemReranker:
         inputs = self._tokenizer([text], return_tensors="pt").to(self._model.device)
         logits = self._model(**inputs).logits[:, -1, :]
 
-        score_logits = torch.stack(
-            [
-                logits[:, self.id_1],
-                logits[:, self.id_2],
-                logits[:, self.id_3],
-                logits[:, self.id_4],
-                logits[:, self.id_5],
-            ],
-            dim=1,
-        )
+        score_logits = torch.stack([logits[:, self.id_no], logits[:, self.id_yes]], dim=1)
         probs = torch.nn.functional.softmax(score_logits, dim=1)[0]
         p = probs.tolist()
-        weighted = sum((idx + 1) * val for idx, val in enumerate(p))
+        yes_prob = float(p[1])
 
         return {
-            "probs": {"1": p[0], "2": p[1], "3": p[2], "4": p[3], "5": p[4]},
-            "weighted_score": float(weighted),
+            "probs": {"no": p[0], "yes": p[1]},
+            "weighted_score": yes_prob,
         }
 
     @staticmethod
@@ -125,39 +109,25 @@ class LLMItemReranker:
         preference_constraints: Dict[str, Any],
         item: Dict[str, Any],
     ) -> str:
-        must_have = preference_constraints.get("Must_Have", [])
-        nice_to_have = preference_constraints.get("Nice_to_Have", [])
         must_avoid = preference_constraints.get("Must_Avoid", [])
 
         profile = item.get("profile", {})
         compact_item = {
-            "item_id": item.get("item_id"),
             "title": profile.get("title", ""),
             "taxonomy": profile.get("taxonomy", {}),
             "text_tags": profile.get("text_tags", {}),
             "visual_tags": profile.get("visual_tags", {}),
-            "hypotheses": profile.get("hypotheses", []),
-            "overall_confidence": profile.get("overall_confidence", 0.0),
         }
 
         next_predictions = preference_constraints.get("Predicted_Next_Items", [])
 
         return (
-            "你是电商推荐精排专家（Agent5）。请从用户视角判断候选商品与当下偏好的匹配程度。\n"
-            "评分规则（只能取1~5）：\n"
-            "注意：这是 next-item 预测场景，需重点判断该候选是否与 Predicted_Next_Items 一致。\n"
-            "1=触碰Must_Avoid或与核心诉求明显冲突；\n"
-            "2=弱相关，仅少量满足；\n"
-            "3=中等相关，满足部分Must_Have或多个Nice_to_Have；\n"
-            "4=高相关，满足大多数Must_Have且有Nice_to_Have加分；\n"
-            "5=强匹配，完整满足Must_Have且无冲突，同时在Nice_to_Have表现突出。\n"
-            "请只输出一个数字：1/2/3/4/5。\n\n"
-            f"用户Query: {query}\n"
-            f"Must_Have: {json.dumps(must_have, ensure_ascii=False)}\n"
-            f"Nice_to_Have: {json.dumps(nice_to_have, ensure_ascii=False)}\n"
-            f"Must_Avoid: {json.dumps(must_avoid, ensure_ascii=False)}\n"
-            f"Predicted_Next_Items: {json.dumps(next_predictions, ensure_ascii=False)}\n"
-            f"候选商品画像: {json.dumps(compact_item, ensure_ascii=False)}\n"
+            f"Based on the previous interaction history, the user's preference can be summarized as: "
+            f"Must_Avoid={json.dumps(must_avoid, ensure_ascii=False)}; "
+            f"Predicted_Next_Items={json.dumps(next_predictions, ensure_ascii=False)}.\n"
+            f"Please predict whether this user would interact with the item at the next opportunity. "
+            f"The candidate item is '{json.dumps(compact_item, ensure_ascii=False)}'.\n"
+            "Please only response 'yes' or 'no' based on your judgement, do not include any other content including words, space, and punctuations in your response."
         )
 
     @staticmethod
@@ -232,7 +202,7 @@ class LLMItemReranker:
         scored.sort(
             key=lambda x: (
                 float(x.get("ranking_score", 0.0)),
-                float((x.get("score_probs") or {}).get("5", 0.0)),
+                float((x.get("score_probs") or {}).get("yes", 0.0)),
             ),
             reverse=True,
         )
