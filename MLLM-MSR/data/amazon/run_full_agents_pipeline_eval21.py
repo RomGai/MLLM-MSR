@@ -15,6 +15,7 @@ import csv
 import json
 import math
 import random
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -162,7 +163,11 @@ def _build_eval21_catalog(
     user_seen_item_ids: Set[str],
     seed: int,
     exclude_seen_for_negatives: bool,
+    negative_sample_count: int,
 ) -> List[str]:
+    if negative_sample_count <= 0:
+        raise ValueError(f"negative_sample_count must be > 0, got {negative_sample_count}")
+
     rng = random.Random(seed)
     negatives: List[str] = []
     used = {chosen_positive}
@@ -174,7 +179,7 @@ def _build_eval21_catalog(
             continue
         negatives.append(item_id)
         used.add(item_id)
-        if len(negatives) >= 20:
+        if len(negatives) >= negative_sample_count:
             break
 
     candidate_pool = []
@@ -188,17 +193,28 @@ def _build_eval21_catalog(
     rng.shuffle(candidate_pool)
     for item_id in candidate_pool:
         negatives.append(item_id)
-        if len(negatives) >= 20:
+        if len(negatives) >= negative_sample_count:
             break
 
-    if len(negatives) < 20:
+    if len(negatives) < negative_sample_count:
         raise ValueError(
-            f"Cannot build 20 negatives for user={unit.user_id}; got {len(negatives)}"
+            f"Cannot build {negative_sample_count} negatives for user={unit.user_id}; got {len(negatives)}"
         )
 
-    group = [chosen_positive] + negatives[:20]
+    group = [chosen_positive] + negatives[:negative_sample_count]
     rng.shuffle(group)
     return group
+
+
+def _bundle_eval_run_root(eval_run_root: str | Path, bundle_output: str | Path) -> Path:
+    root = Path(eval_run_root)
+    bundle = Path(bundle_output)
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for child in root.rglob("*"):
+            if child.is_file():
+                zf.write(child, arcname=str(child.relative_to(root)))
+    return bundle
 
 
 def _write_filtered_item_desc(rows: Sequence[Dict[str, str]], keep_item_ids: Set[str], out_path: str | Path) -> None:
@@ -430,6 +446,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--exclude-seen-for-negatives", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
+        "--negative-sample-count",
+        type=int,
+        default=20,
+        help="Number of random negative samples to build with the 1 positive item.",
+    )
+    parser.add_argument(
         "--disable-agent3-item-type-filter",
         action="store_true",
         help=(
@@ -495,8 +517,9 @@ def main(args: argparse.Namespace) -> None:
     item_rows = _read_item_desc_rows(args.item_desc_tsv)
     item_map = {r["item_id"]: r for r in item_rows}
     all_item_ids = list(item_map.keys())
-    if len(all_item_ids) < 21:
-        raise ValueError("item-desc-tsv has <21 items")
+    required_total_items = int(args.negative_sample_count) + 1
+    if len(all_item_ids) < required_total_items:
+        raise ValueError(f"item-desc-tsv has <{required_total_items} items")
 
     units_all = _read_user_items_negs(args.eval_user_items_negs_tsv)
     if not units_all:
@@ -551,6 +574,7 @@ def main(args: argparse.Namespace) -> None:
             user_seen_item_ids=user_seen,
             seed=int(args.seed) + idx,
             exclude_seen_for_negatives=bool(args.exclude_seen_for_negatives),
+            negative_sample_count=int(args.negative_sample_count),
         )
 
         user_dir = root / f"user_{unit.user_id}"
@@ -571,6 +595,7 @@ def main(args: argparse.Namespace) -> None:
             "selected_positive_item": selected_positive,
             "eval21_items": eval21_items,
             "selected_group_size": len(eval21_items),
+            "negative_sample_count": int(args.negative_sample_count),
             "agent2_user_items_negs_rows": selected_rows,
             "agent2_user_items_negs_tsv": str(per_user_agent2_user_items_negs),
             "global_db_path": shared_global_db_path or str(user_dir / "global_item_features.db"),
@@ -656,7 +681,9 @@ def main(args: argparse.Namespace) -> None:
         )
 
     if args.prepare_only:
+        bundle_file = _bundle_eval_run_root(root, args.bundle_output)
         print(json.dumps({"prepared_users": total, "eval_run_root": str(root)}, ensure_ascii=False, indent=2))
+        print(json.dumps({"bundle_output": str(bundle_file)}, ensure_ascii=False, indent=2))
         return
 
     final = {
@@ -674,6 +701,8 @@ def main(args: argparse.Namespace) -> None:
         "eval_run_root": str(root),
     }
     (root / "metrics_summary.json").write_text(json.dumps(final, ensure_ascii=False, indent=2), encoding="utf-8")
+    bundle_file = _bundle_eval_run_root(root, args.bundle_output)
+    final["bundle_output"] = str(bundle_file)
     print(json.dumps(final, ensure_ascii=False, indent=2))
 
 
