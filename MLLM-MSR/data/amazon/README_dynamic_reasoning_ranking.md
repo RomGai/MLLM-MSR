@@ -61,3 +61,25 @@ print(out.to_dict())
 ```bash
 python dynamic_reasoning_ranking_agent.py ./processed/intent_dual_recall_outputs/xxx.json --top-n 20
 ```
+
+## Agent3 自适应模态调制（建议实现）
+
+针对你提到的“仅比较 text_rank/vl_rank 谁更小就调权重”过于粗糙的问题，仓库里新增了一个可直接复用的工具：
+- `adaptive_modal_modulation.py`
+
+核心做法：
+1. **Rank -> Quality 非线性映射**：`q=1/rank^γ`（`γ>1` 时，前排名次差异被放大）。
+2. **Softmax 目标权重**：把 `(q_text,q_vl)` 通过温度 `τ` 转成 `(w*_text,w*_vl)`；`τ` 越小越容易收敛到极端。
+3. **置信度与趋势联合步长**：
+   - `confidence = |w*_text - w*_vl|`
+   - 用 `EMA` 维护优势趋势，趋势越稳定，步长越大。
+4. **惯性 + 限幅**：避免单步震荡和硬塌缩（例如限制在 `[0.05,0.95]`）。
+5. **日志压缩**：`build_compact_memory_row` 默认不输出 `path_top5`，仅保留 rank、权重、confidence、trend、step_size 与原因。
+6. **Top-K 规模估计**：可基于 memory 中历史 rank 反推总召回规模，新增 `estimate_total_recall_from_memory`：
+   - 单步最小需求：`K_step = min(text_rank / w_text, vl_rank / w_vl)`
+   - 多步聚合：取 `K_step` 的分位数（默认 75%）再乘安全系数（默认 1.12）
+   - 输出建议：`suggested_total_recall`, `suggested_text_topk`, `suggested_vl_topk`
+
+例如若长期观测接近 `text_rank≈100~200, vl_rank≈500~700`，且当前调制后权重大约 `text:vl=0.9:0.1`，该估计会自然倾向给出“中等总量 + 强文本侧配额”的策略，而不是固定死用 500。
+
+> 若你希望“更极端”收敛：优先调小 `temperature`，并提高 `rank_power` 与 `confidence_scale`。
