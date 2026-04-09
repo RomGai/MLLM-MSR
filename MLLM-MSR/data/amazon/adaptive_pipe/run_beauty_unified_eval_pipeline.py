@@ -303,6 +303,23 @@ def _progress_bar(current: int, total: int, width: int = 24) -> str:
     return "[" + "#" * filled + "-" * (width - filled) + "]"
 
 
+def _align_cached_ids_and_embeddings(
+    cached_ids: List[str],
+    emb_matrix: np.ndarray | None,
+    tag: str,
+) -> Tuple[List[str], np.ndarray | None]:
+    if emb_matrix is None:
+        return cached_ids, emb_matrix
+    rows = int(emb_matrix.shape[0]) if emb_matrix.ndim >= 1 else 0
+    if len(cached_ids) == rows:
+        return cached_ids, emb_matrix
+    aligned = min(len(cached_ids), rows)
+    print(
+        f"[CacheAlign][{tag}] ids={len(cached_ids)} embeddings={rows} mismatch -> aligned={aligned}"
+    )
+    return cached_ids[:aligned], emb_matrix[:aligned]
+
+
 def _route_query(query: str, category_catalog: List[str], enable_llm: bool, text_model: str) -> Dict[str, Any]:
     if not enable_llm:
         return {
@@ -1200,6 +1217,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         npz = np.load(emb_cache_path, allow_pickle=True)
         item_ids_cached = [str(x) for x in npz["item_ids"].tolist()]
         item_emb_matrix = npz["item_embeddings"].astype(np.float32, copy=False)
+        item_ids_cached, item_emb_matrix = _align_cached_ids_and_embeddings(
+            item_ids_cached, item_emb_matrix, tag="text"
+        )
         print(f"[Init] stage=load_text_embedding_cache loaded_rows={len(item_ids_cached)}")
 
     if item_emb_matrix is None or item_ids_cached != all_item_ids:
@@ -1247,6 +1267,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             q_npz = np.load(qwen3vl_emb_cache_path, allow_pickle=True)
             q_item_ids_cached = [str(x) for x in q_npz["item_ids"].tolist()]
             q_item_emb_matrix = q_npz["item_embeddings"].astype(np.float32, copy=False)
+            q_item_ids_cached, q_item_emb_matrix = _align_cached_ids_and_embeddings(
+                q_item_ids_cached, q_item_emb_matrix, tag="qwen3vl_loaded"
+            )
             if q_item_emb_matrix is not None:
                 q_item_ids_cached, q_item_emb_matrix = _repair_qwen3vl_cache_for_missing_ids(
                     qwen3vl_model=qwen3vl_model,
@@ -1270,6 +1293,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 image_url_to_local=image_url_to_local,
             )
             q_item_ids_cached = list(all_item_ids)
+            q_item_ids_cached, q_item_emb_matrix = _align_cached_ids_and_embeddings(
+                q_item_ids_cached, q_item_emb_matrix, tag="qwen3vl_rebuilt"
+            )
         elif q_item_ids_cached != all_item_ids:
             print(
                 "[Agent3][Qwen3VL] cache still partial after repair; "
@@ -1277,6 +1303,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             )
         else:
             print("[Init] stage=multimodal_embedding_cache_hit")
+        q_item_ids_cached, q_item_emb_matrix = _align_cached_ids_and_embeddings(
+            q_item_ids_cached, q_item_emb_matrix, tag="qwen3vl_final"
+        )
         qwen3vl_item_emb_norm = _l2_normalize(q_item_emb_matrix)
         qwen3vl_item_id_to_index = {iid: idx for idx, iid in enumerate(q_item_ids_cached)}
     global_db = GlobalItemDB(args.global_db)
@@ -1415,26 +1444,37 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 qwen3vl_ids = []
             else:
                 qwen_filtered_idx = [qwen3vl_item_id_to_index[iid] for iid in qwen_filtered_item_ids]
-                q_filtered_emb = qwen3vl_item_emb_norm[np.array(qwen_filtered_idx)]
-                qwen3vl_sim = np.matmul(q_filtered_emb, qwen3vl_q_emb_norm)
-                qwen3vl_rank_indices = np.argsort(-qwen3vl_sim)
-                qwen_all_item_ids = [iid for iid in all_item_ids if iid in qwen3vl_item_id_to_index]
-                qwen_all_idx = [qwen3vl_item_id_to_index[iid] for iid in qwen_all_item_ids]
-                qwen_all_emb = qwen3vl_item_emb_norm[np.array(qwen_all_idx)]
-                qwen_all_sim = np.matmul(qwen_all_emb, qwen3vl_q_emb_norm)
-                qwen_sim_aligned = np.full(len(all_item_ids), -1e9, dtype=np.float32)
-                aligned_pos = np.array([item_id_to_index[iid] for iid in qwen_all_item_ids], dtype=np.int32)
-                qwen_sim_aligned[aligned_pos] = qwen_all_sim.astype(np.float32, copy=False)
-                qwen3vl_rank_indices_all = np.argsort(-qwen_sim_aligned)
-                mm_topk = max(1, int(args.agent3_qwen3vl_topk))
-                qwen3vl_ids = [qwen_filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:mm_topk]]
-                top_ids = _merge_unique_ids(top_ids, qwen3vl_ids)
-                used_k = len(top_ids)
-                kw_debug["qwen3vl_enabled"] = True
-                kw_debug["qwen3vl_topk"] = mm_topk
-                kw_debug["qwen3vl_pool_size"] = len(qwen3vl_ids)
-                kw_debug["qwen3vl_embedded_pool_size"] = len(qwen_filtered_item_ids)
-                kw_debug["merged_pool_size"] = len(top_ids)
+                qwen_filtered_idx = [idx for idx in qwen_filtered_idx if 0 <= int(idx) < int(qwen3vl_item_emb_norm.shape[0])]
+                qwen_filtered_item_ids = [iid for iid in qwen_filtered_item_ids if iid in qwen3vl_item_id_to_index and 0 <= int(qwen3vl_item_id_to_index[iid]) < int(qwen3vl_item_emb_norm.shape[0])]
+                if not qwen_filtered_idx:
+                    kw_debug["qwen3vl_enabled"] = False
+                    kw_debug["qwen3vl_reason"] = "qwen3vl_index_out_of_range_after_cache_align"
+                    qwen3vl_rank_indices = None
+                    qwen3vl_ids = []
+                else:
+                    q_filtered_emb = qwen3vl_item_emb_norm[np.array(qwen_filtered_idx)]
+                    qwen3vl_sim = np.matmul(q_filtered_emb, qwen3vl_q_emb_norm)
+                    qwen3vl_rank_indices = np.argsort(-qwen3vl_sim)
+                    qwen_all_item_ids = [
+                        iid for iid in all_item_ids
+                        if iid in qwen3vl_item_id_to_index and 0 <= int(qwen3vl_item_id_to_index[iid]) < int(qwen3vl_item_emb_norm.shape[0])
+                    ]
+                    qwen_all_idx = [qwen3vl_item_id_to_index[iid] for iid in qwen_all_item_ids]
+                    qwen_all_emb = qwen3vl_item_emb_norm[np.array(qwen_all_idx)]
+                    qwen_all_sim = np.matmul(qwen_all_emb, qwen3vl_q_emb_norm)
+                    qwen_sim_aligned = np.full(len(all_item_ids), -1e9, dtype=np.float32)
+                    aligned_pos = np.array([item_id_to_index[iid] for iid in qwen_all_item_ids], dtype=np.int32)
+                    qwen_sim_aligned[aligned_pos] = qwen_all_sim.astype(np.float32, copy=False)
+                    qwen3vl_rank_indices_all = np.argsort(-qwen_sim_aligned)
+                    mm_topk = max(1, int(args.agent3_qwen3vl_topk))
+                    qwen3vl_ids = [qwen_filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:mm_topk]]
+                    top_ids = _merge_unique_ids(top_ids, qwen3vl_ids)
+                    used_k = len(top_ids)
+                    kw_debug["qwen3vl_enabled"] = True
+                    kw_debug["qwen3vl_topk"] = mm_topk
+                    kw_debug["qwen3vl_pool_size"] = len(qwen3vl_ids)
+                    kw_debug["qwen3vl_embedded_pool_size"] = len(qwen_filtered_item_ids)
+                    kw_debug["merged_pool_size"] = len(top_ids)
         else:
             kw_debug["qwen3vl_enabled"] = False
         if bool(getattr(args, "enable_agent3_adaptive_weighting", False)):
