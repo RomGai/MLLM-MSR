@@ -296,6 +296,13 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _progress_bar(current: int, total: int, width: int = 24) -> str:
+    total = max(1, int(total))
+    current = min(max(0, int(current)), total)
+    filled = int(width * current / total)
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
 def _route_query(query: str, category_catalog: List[str], enable_llm: bool, text_model: str) -> Dict[str, Any]:
     if not enable_llm:
         return {
@@ -915,9 +922,7 @@ def _adaptive_embedding_fusion(
         "total_recall": int(min(500, total_k)),
         "agent_final_params": agent_final_params,
         "history_item_count": len(history_candidates),
-        "history_items_in_recall_pool": int(
-            sum(1 for iid in pseudo_targets if iid in text_rank_map or iid in vl_rank_map)
-        ),
+        "history_items_in_recall_pool": int(sum(1 for row in memory if bool(row.get("rank_available", False)))),
         "pseudo_query_count": len(pseudo_targets),
         "memory": memory,
     }
@@ -1111,7 +1116,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         rng = random.Random(int(args.seed))
         all_catalog_ids = sorted(meta_map.keys())
         query_rows: List[Dict[str, Any]] = []
-        for unit in units_all:
+        target_build_users = int(args.max_users) if int(args.max_users) > 0 else len(units_all)
+        print(
+            f"[BuildProcessedEval] start total_units={len(units_all)} "
+            f"target_build_users={target_build_users} negative_sample_count={int(args.negative_sample_count)}"
+        )
+        for unit_idx, unit in enumerate(units_all, start=1):
+            if len(query_rows) >= target_build_users:
+                break
             target_id = _latest_positive_by_timestamp(
                 user_pairs_tsv=args.user_pairs_tsv,
                 user_id=unit.user_id,
@@ -1132,8 +1144,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     "eval_pool_ids": eval_pool_ids,
                 }
             )
-        if args.max_users > 0:
-            query_rows = query_rows[: args.max_users]
+            if unit_idx % 50 == 0 or len(query_rows) == target_build_users:
+                print(
+                    f"[BuildProcessedEval] {len(query_rows)}/{target_build_users} "
+                    f"{_progress_bar(len(query_rows), target_build_users)} "
+                    f"(scanned_units={unit_idx}/{len(units_all)})"
+                )
+        print(f"[BuildProcessedEval] done built_users={len(query_rows)}")
     else:
         meta_map = load_filtered_meta(Path(args.filtered_meta_jsonl))
         query_rows = []
@@ -1162,22 +1179,31 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     emb_cache_path = cache_dir / "agent3_item_embedding_cache.npz"
     qwen3vl_emb_cache_path = cache_dir / "agent3_item_qwen3vl_embedding_cache.npz"
     text_cache_path = cache_dir / "agent3_text_cache.json"
+    print(
+        f"[Init] stage=prepare_cache_paths cache_dir={cache_dir} "
+        f"text_cache_exists={text_cache_path.exists()} "
+        f"text_emb_cache_exists={emb_cache_path.exists()} "
+        f"qwen3vl_emb_cache_exists={qwen3vl_emb_cache_path.exists()}"
+    )
 
     text_cache = _safe_json_load(text_cache_path, {"items": {}, "queries": {}})
     item_sentence_cache: Dict[str, str] = text_cache.get("items", {})
     query_sentence_cache: Dict[str, str] = text_cache.get("queries", {})
 
-    print(f"[Init] load embedding model: {args.embedding_model}")
+    print(f"[Init] stage=load_text_embedding_model model={args.embedding_model}")
     emb_model = SentenceTransformer(args.embedding_model)
 
     item_ids_cached: List[str] = []
     item_emb_matrix: np.ndarray | None = None
     if emb_cache_path.exists():
+        print(f"[Init] stage=load_text_embedding_cache path={emb_cache_path}")
         npz = np.load(emb_cache_path, allow_pickle=True)
         item_ids_cached = [str(x) for x in npz["item_ids"].tolist()]
         item_emb_matrix = npz["item_embeddings"].astype(np.float32, copy=False)
+        print(f"[Init] stage=load_text_embedding_cache loaded_rows={len(item_ids_cached)}")
 
     if item_emb_matrix is None or item_ids_cached != all_item_ids:
+        print("[Init] stage=rebuild_text_embedding_cache")
         item_emb_matrix = _build_item_embedding_cache(
             emb_model=emb_model,
             all_item_ids=all_item_ids,
@@ -1188,6 +1214,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             chunk_size=args.embed_chunk_size,
             save_every_n=args.embed_save_every,
         )
+    else:
+        print("[Init] stage=text_embedding_cache_hit")
 
     item_emb_norm = _l2_normalize(item_emb_matrix)
     qwen3vl_model = None
@@ -1198,7 +1226,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             from adaptive_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
         except ModuleNotFoundError:
             from qwen3_vl_embedding import Qwen3VLEmbedder
-        print(f"[Init] load multimodal embedding model: {args.agent3_qwen3vl_model}")
+        print(f"[Init] stage=load_multimodal_embedding_model model={args.agent3_qwen3vl_model}")
         image_cache_dir = cache_dir / "agent3_qwen3vl_images"
         image_url_to_local = prefetch_item_images(
             meta_map=meta_map,
@@ -1215,6 +1243,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         q_item_ids_cached: List[str] = []
         q_item_emb_matrix: np.ndarray | None = None
         if qwen3vl_emb_cache_path.exists():
+            print(f"[Init] stage=load_multimodal_embedding_cache path={qwen3vl_emb_cache_path}")
             q_npz = np.load(qwen3vl_emb_cache_path, allow_pickle=True)
             q_item_ids_cached = [str(x) for x in q_npz["item_ids"].tolist()]
             q_item_emb_matrix = q_npz["item_embeddings"].astype(np.float32, copy=False)
@@ -1230,6 +1259,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     chunk_size=max(1, int(args.agent3_qwen3vl_chunk_size)),
                 )
         if q_item_emb_matrix is None:
+            print("[Init] stage=rebuild_multimodal_embedding_cache")
             q_item_emb_matrix = _build_qwen3vl_item_embedding_cache(
                 qwen3vl_model=qwen3vl_model,
                 all_item_ids=all_item_ids,
@@ -1245,6 +1275,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 "[Agent3][Qwen3VL] cache still partial after repair; "
                 "skip full rebuild and use available embedded subset only."
             )
+        else:
+            print("[Init] stage=multimodal_embedding_cache_hit")
         qwen3vl_item_emb_norm = _l2_normalize(q_item_emb_matrix)
         qwen3vl_item_id_to_index = {iid: idx for idx, iid in enumerate(q_item_ids_cached)}
     global_db = GlobalItemDB(args.global_db)
@@ -1262,6 +1294,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         target_id = str(row.get("id", "")).strip()
         if not user_id or not target_id:
             continue
+        print(
+            f"[UserLoop][Progress] {row_idx + 1}/{len(query_rows)} "
+            f"{_progress_bar(row_idx + 1, len(query_rows))} stage=prepare user={user_id} target={target_id}"
+        )
         history_ids = list(
             dict.fromkeys(
                 x.strip() for x in str(row.get("remaining_interaction_string", "")).split("|") if x.strip()
@@ -1283,6 +1319,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             print(f"[UserLoop] user={user_id} has empty ranked_items output, retry Agent3 recall before deciding skip")
 
         routed = _route_query(query, category_catalog, args.enable_llm_routing, args.text_model)
+        print(
+            f"[UserLoop][Progress] {row_idx + 1}/{len(query_rows)} "
+            f"{_progress_bar(row_idx + 1, len(query_rows))} stage=agent3_route_done user={user_id}"
+        )
 
         q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
@@ -1416,6 +1456,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             top_ids = _merge_unique_ids(top_ids, adaptive_ids)
             used_k = len(top_ids)
             kw_debug["adaptive_embedding_state"] = adaptive_state
+            print(
+                f"[UserLoop][Progress] {row_idx + 1}/{len(query_rows)} "
+                f"{_progress_bar(row_idx + 1, len(query_rows))} stage=agent3_adaptive_done user={user_id}"
+            )
         top_ids = [iid for iid in top_ids if iid in eval_pool_set] if eval_pool_set else top_ids
         if target_id not in top_ids:
             top_ids = _merge_unique_ids(top_ids, [target_id])
@@ -1558,6 +1602,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 collaborative_max_items=int(args.collaborative_max_items),
             )
             ranked_first = module3_out.ranked_items[0]["item_id"] if module3_out.ranked_items else ""
+            print(
+                f"[UserLoop][Progress] {row_idx + 1}/{len(query_rows)} "
+                f"{_progress_bar(row_idx + 1, len(query_rows))} stage=agent45_done user={user_id}"
+            )
         else:
             print("[Agent4/5] skipped by --disable-agent45")
 
