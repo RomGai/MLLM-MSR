@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import glob
 import json
 import math
+import random
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Set, Tuple
 
 import numpy as np
-import pandas as pd
 from sentence_transformers import SentenceTransformer
 
 try:
@@ -48,6 +50,13 @@ EN_STOPWORDS = {
 }
 
 
+@dataclass
+class EvalUnit:
+    user_id: str
+    pos_items: List[str]
+    neg_items: List[str]
+
+
 def _parse_meta_line(line: str) -> dict:
     t = line.strip()
     if not t:
@@ -56,6 +65,87 @@ def _parse_meta_line(line: str) -> dict:
         return json.loads(t)
     except json.JSONDecodeError:
         return ast.literal_eval(t)
+
+
+def _read_user_items_negs(path: str | Path) -> List[EvalUnit]:
+    rows: List[EvalUnit] = []
+    p = Path(path)
+    with p.open("r", encoding="utf-8") as f:
+        first_line = f.readline()
+        f.seek(0)
+        has_header = first_line.lower().startswith("user_id\t")
+        if has_header:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                user_id = str(row.get("user_id", "")).strip()
+                pos = [x.strip() for x in str(row.get("pos", "")).split(",") if x.strip()]
+                neg = [x.strip() for x in str(row.get("neg", "")).split(",") if x.strip()]
+                if user_id and pos:
+                    rows.append(EvalUnit(user_id=user_id, pos_items=pos, neg_items=neg))
+        else:
+            reader = csv.reader(f, delimiter="\t")
+            for row in reader:
+                if len(row) < 3:
+                    continue
+                user_id = str(row[0]).strip()
+                pos = [x.strip() for x in str(row[1]).split(",") if x.strip()]
+                neg = [x.strip() for x in str(row[2]).split(",") if x.strip()]
+                if user_id and pos:
+                    rows.append(EvalUnit(user_id=user_id, pos_items=pos, neg_items=neg))
+    return rows
+
+
+def _latest_positive_by_timestamp(
+    user_pairs_tsv: str | Path,
+    user_id: str,
+    positive_item_ids: Sequence[str],
+) -> str:
+    if not positive_item_ids:
+        raise ValueError(f"No positive items for user={user_id}")
+    target_set = {str(i).strip() for i in positive_item_ids if str(i).strip()}
+    if not target_set:
+        return str(positive_item_ids[0]).strip()
+    latest_item = None
+    latest_ts = None
+    with Path(user_pairs_tsv).open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            if str(row.get("user_id", "")).strip() != str(user_id):
+                continue
+            item_id = str(row.get("item_id", "")).strip()
+            if item_id not in target_set:
+                continue
+            ts_raw = str(row.get("timestamp", "")).strip()
+            try:
+                ts_val = int(ts_raw)
+            except (TypeError, ValueError):
+                continue
+            if latest_ts is None or ts_val > latest_ts:
+                latest_ts = ts_val
+                latest_item = item_id
+    return latest_item or str(positive_item_ids[0]).strip()
+
+
+def _build_user_history_map(user_pairs_tsv: str | Path) -> Dict[str, List[str]]:
+    grouped: Dict[str, List[Tuple[int, str]]] = {}
+    with Path(user_pairs_tsv).open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            user_id = str(row.get("user_id", "")).strip()
+            item_id = str(row.get("item_id", "")).strip()
+            if not user_id or not item_id:
+                continue
+            ts_raw = str(row.get("timestamp", "")).strip()
+            try:
+                ts = int(ts_raw)
+            except (TypeError, ValueError):
+                ts = -1
+            grouped.setdefault(user_id, []).append((ts, item_id))
+    out: Dict[str, List[str]] = {}
+    for user_id, seq in grouped.items():
+        seq.sort(key=lambda x: (x[0], x[1]))
+        out[user_id] = [iid for _, iid in seq]
+    return out
 
 
 def load_filtered_meta(path: Path) -> Dict[str, Dict[str, Any]]:
@@ -68,6 +158,24 @@ def load_filtered_meta(path: Path) -> Dict[str, Dict[str, Any]]:
             asin = str(rec.get("asin", "")).strip()
             if asin:
                 out[asin] = rec
+    return out
+
+
+def load_processed_item_desc_as_meta(path: Path) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            item_id = str(row.get("item_id", "")).strip()
+            if not item_id:
+                continue
+            out[item_id] = {
+                "asin": item_id,
+                "title": f"item_{item_id}",
+                "description": str(row.get("summary", "") or ""),
+                "imUrl": str(row.get("image", "") or ""),
+                "categories": [],
+            }
     return out
 
 
@@ -93,6 +201,54 @@ def _item_sentence(meta: Dict[str, Any]) -> str:
         f"title: {str(meta.get('title', '') or '')}; "
         f"description: {str(meta.get('description', '') or '')}"
     ).strip()
+
+
+def _predict_preference_from_history(
+    history_ids: List[str],
+    meta_map: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not history_ids:
+        return {
+            "Must_Have": [],
+            "Nice_to_Have": ["general quality", "high user satisfaction"],
+            "Must_Avoid": [],
+            "Reasoning": "history_empty",
+            "query_text": "general quality products",
+        }
+
+    cat_counter: Dict[str, int] = {}
+    kw_counter: Dict[str, int] = {}
+    valid_count = 0
+    for iid in history_ids:
+        meta = meta_map.get(iid)
+        if meta is None:
+            continue
+        valid_count += 1
+        cat_paths = _meta_category_paths(meta)
+        leaf = ""
+        if cat_paths and cat_paths[0]:
+            leaf = str(cat_paths[0][-1]).strip().lower()
+        if leaf:
+            cat_counter[leaf] = cat_counter.get(leaf, 0) + 1
+        text = f"{meta.get('title', '')} {meta.get('description', '')}".lower()
+        for token in re.findall(r"[a-z0-9]+", text):
+            if token in EN_STOPWORDS or len(token) <= 2:
+                continue
+            kw_counter[token] = kw_counter.get(token, 0) + 1
+
+    top_cats = [k for k, _ in sorted(cat_counter.items(), key=lambda x: (-x[1], x[0]))[:3]]
+    top_kws = [k for k, _ in sorted(kw_counter.items(), key=lambda x: (-x[1], x[0]))[:8]]
+    must_have = [f"prefer {c}" for c in top_cats[:2]]
+    nice_to_have = [f"interest in {k}" for k in top_kws[:6]]
+    query_parts = top_cats[:2] + top_kws[:6]
+    query_text = ", ".join(query_parts) if query_parts else "general quality products"
+    return {
+        "Must_Have": must_have,
+        "Nice_to_Have": nice_to_have,
+        "Must_Avoid": [],
+        "Reasoning": f"history_items={len(history_ids)}, matched_meta={valid_count}",
+        "query_text": query_text,
+    }
 
 
 def _query_sentence(query: str, selected_categories: List[List[str]], rewritten: str) -> str:
@@ -509,7 +665,12 @@ def _adaptive_embedding_fusion(
     filtered_item_ids: List[str],
     text_rank_indices: np.ndarray,
     qwen3vl_rank_indices: np.ndarray | None,
+    emb_model: SentenceTransformer,
+    item_emb_norm: np.ndarray,
     meta_map: Dict[str, Dict[str, Any]],
+    qwen3vl_model: Any = None,
+    qwen3vl_item_emb_norm: np.ndarray | None = None,
+    qwen3vl_item_id_to_index: Dict[str, int] | None = None,
     min_total_recall: int = 500,
     max_total_recall: int = 500,
     max_pseudo_queries: int = 8,
@@ -625,8 +786,7 @@ def _adaptive_embedding_fusion(
         top_ids = [filtered_item_ids[int(idx)] for idx in text_rank_indices[:total_k]]
         return top_ids, {"enabled": False, "reason": "qwen3vl_unavailable", "memory": memory}
 
-    text_rank_map = _rank_position_map(text_rank_indices, filtered_item_ids)
-    vl_rank_map = _rank_position_map(qwen3vl_rank_indices, filtered_item_ids)
+    filtered_id_to_index = {iid: idx for idx, iid in enumerate(filtered_item_ids)}
     history_candidates: List[str] = []
     seen_history: set[str] = set()
     for raw_iid in history_ids:
@@ -640,8 +800,40 @@ def _adaptive_embedding_fusion(
     for step, iid in enumerate(pseudo_targets, start=1):
         prev_text_weight = text_weight
         prev_vl_weight = vl_weight
-        text_rank_raw = text_rank_map.get(iid)
-        vl_rank_raw = vl_rank_map.get(iid)
+        prefix_history = pseudo_targets[: max(0, step - 1)]
+        pseudo_pref = _predict_preference_from_history(prefix_history, meta_map)
+        pseudo_query = str(pseudo_pref.get("query_text", "")).strip()
+        if not pseudo_query:
+            pseudo_query = "general quality products"
+        pseudo_q_emb = _encode_texts(emb_model, [pseudo_query], batch_size=1, prompt_name="query").astype(np.float32, copy=False)
+        pseudo_q_emb_norm = pseudo_q_emb / np.clip(np.linalg.norm(pseudo_q_emb, axis=1, keepdims=True), 1e-12, None)
+        pseudo_text_sim = np.matmul(item_emb_norm, pseudo_q_emb_norm[0])
+        pseudo_text_rank_idx = np.argsort(-pseudo_text_sim)
+        text_rank_raw = None
+        iid_index = filtered_id_to_index.get(iid)
+        if iid_index is not None:
+            text_hits = np.where(pseudo_text_rank_idx == iid_index)[0]
+        else:
+            text_hits = []
+        if len(text_hits) > 0:
+            text_rank_raw = int(text_hits[0]) + 1
+
+        vl_rank_raw = None
+        if (
+            qwen3vl_model is not None
+            and qwen3vl_item_emb_norm is not None
+            and qwen3vl_item_id_to_index is not None
+            and iid in qwen3vl_item_id_to_index
+        ):
+            pseudo_vl_query_input = {"text": pseudo_query}
+            pseudo_vl_emb = _tensor_to_float32_numpy(qwen3vl_model.process([pseudo_vl_query_input]))
+            pseudo_vl_emb_norm = _l2_normalize(pseudo_vl_emb)[0]
+            pseudo_vl_sim = np.matmul(qwen3vl_item_emb_norm, pseudo_vl_emb_norm)
+            pseudo_vl_rank_idx = np.argsort(-pseudo_vl_sim)
+            iid_mm_index = qwen3vl_item_id_to_index[iid]
+            vl_hits = np.where(pseudo_vl_rank_idx == iid_mm_index)[0]
+            if len(vl_hits) > 0:
+                vl_rank_raw = int(vl_hits[0]) + 1
         rank_available = text_rank_raw is not None or vl_rank_raw is not None
         if not rank_available:
             memory.append(
@@ -653,6 +845,7 @@ def _adaptive_embedding_fusion(
                     "rank_available": False,
                     "weights_before": {"text": round(prev_text_weight, 4), "vl": round(prev_vl_weight, 4)},
                     "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
+                    "pseudo_preference": pseudo_pref,
                     "reasoning": "history_item_not_in_current_recall_pool",
                 }
             )
@@ -690,6 +883,7 @@ def _adaptive_embedding_fusion(
                 "rank_available": True,
                 "weights_before": {"text": round(prev_text_weight, 4), "vl": round(prev_vl_weight, 4)},
                 "weights": {"text": round(text_weight, 4), "vl": round(vl_weight, 4)},
+                "pseudo_preference": pseudo_pref,
                 "reasoning": (
                     f"strength_target={round(strength_target_text, 3)}, "
                     f"dominant_share={round(dominant_share, 3)}, "
@@ -908,13 +1102,57 @@ def _has_non_empty_ranked_items(output_path: Path) -> bool:
 
 
 def run(args: argparse.Namespace) -> Dict[str, Any]:
-    query_df = pd.read_csv(args.query_csv, dtype={"id": str, "user_id": str})
-    if args.max_users > 0:
-        query_df = query_df.head(args.max_users)
+    if bool(getattr(args, "use_processed_eval", False)):
+        units_all = _read_user_items_negs(args.eval_user_items_negs_tsv)
+        if not units_all:
+            raise ValueError(f"No eval units in {args.eval_user_items_negs_tsv}")
+        user_history_map = _build_user_history_map(args.user_pairs_tsv)
+        meta_map = load_processed_item_desc_as_meta(Path(args.item_desc_tsv))
+        rng = random.Random(int(args.seed))
+        all_catalog_ids = sorted(meta_map.keys())
+        query_rows: List[Dict[str, Any]] = []
+        for unit in units_all:
+            target_id = _latest_positive_by_timestamp(
+                user_pairs_tsv=args.user_pairs_tsv,
+                user_id=unit.user_id,
+                positive_item_ids=unit.pos_items,
+            )
+            if target_id not in meta_map:
+                continue
+            history_seq = [iid for iid in user_history_map.get(unit.user_id, []) if iid != target_id]
+            pool_candidates = [iid for iid in all_catalog_ids if iid != target_id]
+            sample_k = min(max(1, int(args.negative_sample_count)), len(pool_candidates))
+            sampled_negatives = rng.sample(pool_candidates, k=sample_k) if pool_candidates else []
+            eval_pool_ids = [target_id] + sampled_negatives
+            query_rows.append(
+                {
+                    "user_id": unit.user_id,
+                    "id": target_id,
+                    "remaining_interaction_string": "|".join(history_seq),
+                    "eval_pool_ids": eval_pool_ids,
+                }
+            )
+        if args.max_users > 0:
+            query_rows = query_rows[: args.max_users]
+    else:
+        meta_map = load_filtered_meta(Path(args.filtered_meta_jsonl))
+        query_rows = []
+        with Path(args.query_csv).open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                query_rows.append(
+                    {
+                        "user_id": str(row.get("user_id", "")).strip(),
+                        "id": str(row.get("id", "")).strip(),
+                        "query": str(row.get("new_query") or row.get("query") or "").strip(),
+                        "remaining_interaction_string": str(row.get("remaining_interaction_string", "") or ""),
+                    }
+                )
+        if args.max_users > 0:
+            query_rows = query_rows[: args.max_users]
 
-    meta_map = load_filtered_meta(Path(args.filtered_meta_jsonl))
     if not meta_map:
-        raise ValueError(f"No items loaded from filtered meta: {args.filtered_meta_jsonl}")
+        raise ValueError("No items loaded into meta_map.")
 
     all_item_ids = sorted(meta_map.keys())
     item_id_to_index = {iid: idx for idx, iid in enumerate(all_item_ids)}
@@ -954,6 +1192,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     item_emb_norm = _l2_normalize(item_emb_matrix)
     qwen3vl_model = None
     qwen3vl_item_emb_norm: np.ndarray | None = None
+    qwen3vl_item_id_to_index: Dict[str, int] = {}
     if args.enable_agent3_qwen3vl_embedding:
         try:
             from adaptive_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
@@ -1018,14 +1257,22 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     if modal_trace_path.exists():
         modal_trace_path.unlink()
 
-    for row_idx, row in query_df.iterrows():
-        user_id = str(row["user_id"])
-        target_id = str(row["id"])
-        query = str(row.get("new_query") or row.get("query") or "").strip()
-        if not query:
+    for row_idx, row in enumerate(query_rows):
+        user_id = str(row.get("user_id", "")).strip()
+        target_id = str(row.get("id", "")).strip()
+        if not user_id or not target_id:
             continue
+        history_ids = list(
+            dict.fromkeys(
+                x.strip() for x in str(row.get("remaining_interaction_string", "")).split("|") if x.strip()
+            )
+        )
+        current_pref = _predict_preference_from_history(history_ids, meta_map)
+        query = str(current_pref.get("query_text", "")).strip()
+        if not query:
+            query = "general quality products"
 
-        print(f"\n[UserLoop] {row_idx + 1}/{len(query_df)} user={user_id} target={target_id}")
+        print(f"\n[UserLoop] {row_idx + 1}/{len(query_rows)} user={user_id} target={target_id}")
 
         existing_output = Path(args.output_dir) / f"user_{user_id}_dynamic_reasoning_ranking_output.json"
         if _has_non_empty_ranked_items(existing_output):
@@ -1039,14 +1286,18 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
+        eval_pool_ids_raw = row.get("eval_pool_ids", [])
+        eval_pool_ids = [iid for iid in eval_pool_ids_raw if iid in item_id_to_index]
+        eval_pool_set = set(eval_pool_ids)
+        base_candidate_ids = eval_pool_ids if eval_pool_ids else list(all_item_ids)
 
         query_recall_pool_mode = str(getattr(args, "agent3_query_recall_pool", "filtered")).strip().lower()
         if query_recall_pool_mode == "full":
-            filtered_item_ids = list(all_item_ids)
+            filtered_item_ids = list(base_candidate_ids)
             print(f"[Agent3][categories] query_recall_pool=full candidate_count={len(filtered_item_ids)}")
         else:
             filtered_item_ids = _filter_item_ids_by_categories(
-                candidate_item_ids=all_item_ids,
+                candidate_item_ids=base_candidate_ids,
                 meta_map=meta_map,
                 selected_categories=routed.get("selected_category_paths", []) or [],
             )
@@ -1146,18 +1397,18 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 kw_debug["merged_pool_size"] = len(top_ids)
         else:
             kw_debug["qwen3vl_enabled"] = False
-        history_ids = list(
-            dict.fromkeys(
-                x.strip() for x in str(row.get("remaining_interaction_string", "")).split("|") if x.strip()
-            )
-        )
         if bool(getattr(args, "enable_agent3_adaptive_weighting", False)):
             adaptive_ids, adaptive_state = _adaptive_embedding_fusion(
                 history_ids=history_ids,
                 filtered_item_ids=all_item_ids,
                 text_rank_indices=full_rank_indices,
                 qwen3vl_rank_indices=qwen3vl_rank_indices_all,
+                emb_model=emb_model,
+                item_emb_norm=item_emb_norm,
                 meta_map=meta_map,
+                qwen3vl_model=qwen3vl_model,
+                qwen3vl_item_emb_norm=qwen3vl_item_emb_norm,
+                qwen3vl_item_id_to_index=qwen3vl_item_id_to_index if args.enable_agent3_qwen3vl_embedding else None,
                 min_total_recall=int(getattr(args, "agent3_adaptive_min_total_recall", 500)),
                 max_total_recall=int(getattr(args, "agent3_adaptive_max_total_recall", 500)),
                 max_pseudo_queries=int(getattr(args, "agent3_adaptive_max_pseudo_queries", 8)),
@@ -1165,6 +1416,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             top_ids = _merge_unique_ids(top_ids, adaptive_ids)
             used_k = len(top_ids)
             kw_debug["adaptive_embedding_state"] = adaptive_state
+        top_ids = [iid for iid in top_ids if iid in eval_pool_set] if eval_pool_set else top_ids
+        if target_id not in top_ids:
+            top_ids = _merge_unique_ids(top_ids, [target_id])
+        used_k = len(top_ids)
         adaptive_state = kw_debug.get("adaptive_embedding_state", {}) if isinstance(kw_debug, dict) else {}
         if isinstance(adaptive_state, dict) and adaptive_state.get("enabled"):
             agent_final_params = adaptive_state.get("agent_final_params", {})
@@ -1274,6 +1529,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         agent3_output = {
             "query": q_sentence,
+            "query_preference": {
+                "Must_Have": current_pref.get("Must_Have", []),
+                "Nice_to_Have": current_pref.get("Nice_to_Have", []),
+                "Must_Avoid": current_pref.get("Must_Avoid", []),
+                "Reasoning": current_pref.get("Reasoning", ""),
+            },
             "user_id": user_id,
             "routing": routed,
             "candidate_items": candidate_items,
@@ -1323,6 +1584,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="可运行的 Beauty 统一评估流程：Agent3 -> Agent1/2 -> Agent4/5")
+    parser.add_argument("--use-processed-eval", action="store_true", help="使用processed评估输入（无query）。")
+    parser.add_argument("--item-desc-tsv", default="MLLM-MSR/data/amazon/processed/Baby_Products_item_desc.tsv")
+    parser.add_argument("--user-pairs-tsv", default="MLLM-MSR/data/amazon/processed/Baby_Products_u_i_pairs.tsv")
+    parser.add_argument("--eval-user-items-negs-tsv", default="MLLM-MSR/data/amazon/processed/Baby_Products_user_items_negs_test.csv")
+    parser.add_argument("--negative-sample-count", type=int, default=1000, help="processed模式下，从全库随机采样负样本数量。")
+    parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--query-csv", default="data/amazon_beauty/query_data1.csv")
     parser.add_argument("--filtered-meta-jsonl", default="data/amazon_beauty/meta_Beauty.filtered.jsonl")
     parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
