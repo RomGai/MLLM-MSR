@@ -811,6 +811,17 @@ def _adaptive_embedding_fusion(
         return top_ids, {"enabled": False, "reason": "qwen3vl_unavailable", "memory": memory}
 
     filtered_id_to_index = {iid: idx for idx, iid in enumerate(filtered_item_ids)}
+    qwen_filtered_emb_norm = None
+    qwen_filtered_id_to_local: Dict[str, int] = {}
+    if qwen3vl_item_emb_norm is not None and qwen3vl_item_id_to_index is not None:
+        qwen_filtered_item_ids = [
+            iid for iid in filtered_item_ids
+            if iid in qwen3vl_item_id_to_index and 0 <= int(qwen3vl_item_id_to_index[iid]) < int(qwen3vl_item_emb_norm.shape[0])
+        ]
+        if qwen_filtered_item_ids:
+            qwen_filtered_idx = np.array([qwen3vl_item_id_to_index[iid] for iid in qwen_filtered_item_ids], dtype=np.int32)
+            qwen_filtered_emb_norm = qwen3vl_item_emb_norm[qwen_filtered_idx]
+            qwen_filtered_id_to_local = {iid: idx for idx, iid in enumerate(qwen_filtered_item_ids)}
     history_candidates: List[str] = []
     seen_history: set[str] = set()
     for raw_iid in history_ids:
@@ -845,16 +856,15 @@ def _adaptive_embedding_fusion(
         vl_rank_raw = None
         if (
             qwen3vl_model is not None
-            and qwen3vl_item_emb_norm is not None
-            and qwen3vl_item_id_to_index is not None
-            and iid in qwen3vl_item_id_to_index
+            and qwen_filtered_emb_norm is not None
+            and iid in qwen_filtered_id_to_local
         ):
             pseudo_vl_query_input = {"text": pseudo_query}
             pseudo_vl_emb = _tensor_to_float32_numpy(qwen3vl_model.process([pseudo_vl_query_input]))
             pseudo_vl_emb_norm = _l2_normalize(pseudo_vl_emb)[0]
-            pseudo_vl_sim = np.matmul(qwen3vl_item_emb_norm, pseudo_vl_emb_norm)
+            pseudo_vl_sim = np.matmul(qwen_filtered_emb_norm, pseudo_vl_emb_norm)
             pseudo_vl_rank_idx = np.argsort(-pseudo_vl_sim)
-            iid_mm_index = qwen3vl_item_id_to_index[iid]
+            iid_mm_index = qwen_filtered_id_to_local[iid]
             vl_hits = np.where(pseudo_vl_rank_idx == iid_mm_index)[0]
             if len(vl_hits) > 0:
                 vl_rank_raw = int(vl_hits[0]) + 1
@@ -1359,6 +1369,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         eval_pool_ids = [iid for iid in eval_pool_ids_raw if iid in item_id_to_index]
         eval_pool_set = set(eval_pool_ids)
         base_candidate_ids = eval_pool_ids if eval_pool_ids else list(all_item_ids)
+        adaptive_enabled = bool(getattr(args, "enable_agent3_adaptive_weighting", False))
 
         query_recall_pool_mode = str(getattr(args, "agent3_query_recall_pool", "filtered")).strip().lower()
         if query_recall_pool_mode == "full":
@@ -1408,10 +1419,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         q_emb_norm = q_emb / np.clip(np.linalg.norm(q_emb, axis=1, keepdims=True), 1e-12, None)
         sim_matrix = np.matmul(filtered_emb, q_emb_norm[0])
         rank_indices = np.argsort(-sim_matrix)
-        full_sim_matrix = np.matmul(item_emb_norm, q_emb_norm[0])
-        full_rank_indices = np.argsort(-full_sim_matrix)
 
-        adaptive_enabled = bool(getattr(args, "enable_agent3_adaptive_weighting", False))
         keywords = _extract_query_keywords(query, max_keywords=args.max_query_keywords)
         if adaptive_enabled:
             top_ids = []
@@ -1437,7 +1445,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 embedding_recall_topk=hybrid_embedding_topk,
             )
         qwen3vl_rank_indices = None
-        qwen3vl_rank_indices_all = None
+        qwen3vl_rank_indices_aligned = None
         if args.enable_agent3_qwen3vl_embedding and qwen3vl_model is not None and qwen3vl_item_emb_norm is not None:
             qwen3vl_query_input = {"text": q_sentence}
             query_image = str(row.get("query_image") or row.get("image") or row.get("image_url") or "").strip()
@@ -1466,17 +1474,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     q_filtered_emb = qwen3vl_item_emb_norm[np.array(qwen_filtered_idx)]
                     qwen3vl_sim = np.matmul(q_filtered_emb, qwen3vl_q_emb_norm)
                     qwen3vl_rank_indices = np.argsort(-qwen3vl_sim)
-                    qwen_all_item_ids = [
-                        iid for iid in all_item_ids
-                        if iid in qwen3vl_item_id_to_index and 0 <= int(qwen3vl_item_id_to_index[iid]) < int(qwen3vl_item_emb_norm.shape[0])
-                    ]
-                    qwen_all_idx = [qwen3vl_item_id_to_index[iid] for iid in qwen_all_item_ids]
-                    qwen_all_emb = qwen3vl_item_emb_norm[np.array(qwen_all_idx)]
-                    qwen_all_sim = np.matmul(qwen_all_emb, qwen3vl_q_emb_norm)
-                    qwen_sim_aligned = np.full(len(all_item_ids), -1e9, dtype=np.float32)
-                    aligned_pos = np.array([item_id_to_index[iid] for iid in qwen_all_item_ids], dtype=np.int32)
-                    qwen_sim_aligned[aligned_pos] = qwen_all_sim.astype(np.float32, copy=False)
-                    qwen3vl_rank_indices_all = np.argsort(-qwen_sim_aligned)
+                    qwen_sim_aligned = np.full(len(filtered_item_ids), -1e9, dtype=np.float32)
+                    filtered_pos = {iid: idx for idx, iid in enumerate(filtered_item_ids)}
+                    aligned_pos = np.array([filtered_pos[iid] for iid in qwen_filtered_item_ids], dtype=np.int32)
+                    qwen_sim_aligned[aligned_pos] = qwen3vl_sim.astype(np.float32, copy=False)
+                    qwen3vl_rank_indices_aligned = np.argsort(-qwen_sim_aligned)
                     if adaptive_enabled:
                         qwen3vl_ids = []
                         kw_debug["qwen3vl_enabled"] = True
@@ -1499,11 +1501,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         if adaptive_enabled:
             adaptive_ids, adaptive_state = _adaptive_embedding_fusion(
                 history_ids=history_ids,
-                filtered_item_ids=all_item_ids,
-                text_rank_indices=full_rank_indices,
-                qwen3vl_rank_indices=qwen3vl_rank_indices_all,
+                filtered_item_ids=filtered_item_ids,
+                text_rank_indices=rank_indices,
+                qwen3vl_rank_indices=qwen3vl_rank_indices_aligned,
                 emb_model=emb_model,
-                item_emb_norm=item_emb_norm,
+                item_emb_norm=filtered_emb,
                 meta_map=meta_map,
                 qwen3vl_model=qwen3vl_model,
                 qwen3vl_item_emb_norm=qwen3vl_item_emb_norm,
@@ -1519,9 +1521,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 f"[UserLoop][Progress] {row_idx + 1}/{len(query_rows)} "
                 f"{_progress_bar(row_idx + 1, len(query_rows))} stage=agent3_adaptive_done user={user_id}"
             )
-        top_ids = [iid for iid in top_ids if iid in eval_pool_set] if eval_pool_set else top_ids
-        if target_id not in top_ids:
-            top_ids = _merge_unique_ids(top_ids, [target_id])
+        # NOTE:
+        # - In adaptive mode we already build recall directly on the current candidate pool
+        #   (`filtered_item_ids`, typically target+negatives in eval), so no extra set
+        #   intersection/union should be applied here.
+        # - In non-adaptive mode keep legacy safety alignment with eval pool.
+        if not adaptive_enabled:
+            top_ids = [iid for iid in top_ids if iid in eval_pool_set] if eval_pool_set else top_ids
+            if target_id not in top_ids:
+                top_ids = _merge_unique_ids(top_ids, [target_id])
         used_k = len(top_ids)
         adaptive_state = kw_debug.get("adaptive_embedding_state", {}) if isinstance(kw_debug, dict) else {}
         if isinstance(adaptive_state, dict) and adaptive_state.get("enabled"):
