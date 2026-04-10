@@ -1411,20 +1411,31 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         full_sim_matrix = np.matmul(item_emb_norm, q_emb_norm[0])
         full_rank_indices = np.argsort(-full_sim_matrix)
 
+        adaptive_enabled = bool(getattr(args, "enable_agent3_adaptive_weighting", False))
         keywords = _extract_query_keywords(query, max_keywords=args.max_query_keywords)
-        hybrid_embedding_topk = (
-            0
-            if bool(getattr(args, "enable_agent3_adaptive_weighting", False))
-            else int(args.embedding_recall_topk if args.embedding_recall_topk > 0 else args.fixed_recall_topk)
-        )
-        top_ids, used_k, kw_debug = _build_hybrid_recall_ids(
-            all_item_ids=filtered_item_ids,
-            title_lower_map=title_lower_map,
-            keywords=keywords,
-            rank_indices=rank_indices,
-            keyword_recall_topk=int(args.keyword_recall_topk if args.keyword_recall_topk > 0 else args.fixed_recall_topk),
-            embedding_recall_topk=hybrid_embedding_topk,
-        )
+        if adaptive_enabled:
+            top_ids = []
+            used_k = 0
+            kw_debug = {
+                "keywords": keywords,
+                "keyword_matched_count": 0,
+                "keyword_stage": "disabled_by_adaptive_only_mode",
+                "keyword_pool_size": 0,
+                "embedding_pool_size": 0,
+                "merged_pool_size": 0,
+                "keyword_recall_topk": 0,
+                "embedding_recall_topk": 0,
+            }
+        else:
+            hybrid_embedding_topk = int(args.embedding_recall_topk if args.embedding_recall_topk > 0 else args.fixed_recall_topk)
+            top_ids, used_k, kw_debug = _build_hybrid_recall_ids(
+                all_item_ids=filtered_item_ids,
+                title_lower_map=title_lower_map,
+                keywords=keywords,
+                rank_indices=rank_indices,
+                keyword_recall_topk=int(args.keyword_recall_topk if args.keyword_recall_topk > 0 else args.fixed_recall_topk),
+                embedding_recall_topk=hybrid_embedding_topk,
+            )
         qwen3vl_rank_indices = None
         qwen3vl_rank_indices_all = None
         if args.enable_agent3_qwen3vl_embedding and qwen3vl_model is not None and qwen3vl_item_emb_norm is not None:
@@ -1466,18 +1477,26 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     aligned_pos = np.array([item_id_to_index[iid] for iid in qwen_all_item_ids], dtype=np.int32)
                     qwen_sim_aligned[aligned_pos] = qwen_all_sim.astype(np.float32, copy=False)
                     qwen3vl_rank_indices_all = np.argsort(-qwen_sim_aligned)
-                    mm_topk = max(1, int(args.agent3_qwen3vl_topk))
-                    qwen3vl_ids = [qwen_filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:mm_topk]]
-                    top_ids = _merge_unique_ids(top_ids, qwen3vl_ids)
-                    used_k = len(top_ids)
-                    kw_debug["qwen3vl_enabled"] = True
-                    kw_debug["qwen3vl_topk"] = mm_topk
-                    kw_debug["qwen3vl_pool_size"] = len(qwen3vl_ids)
-                    kw_debug["qwen3vl_embedded_pool_size"] = len(qwen_filtered_item_ids)
-                    kw_debug["merged_pool_size"] = len(top_ids)
+                    if adaptive_enabled:
+                        qwen3vl_ids = []
+                        kw_debug["qwen3vl_enabled"] = True
+                        kw_debug["qwen3vl_topk"] = 0
+                        kw_debug["qwen3vl_pool_size"] = 0
+                        kw_debug["qwen3vl_embedded_pool_size"] = len(qwen_filtered_item_ids)
+                        kw_debug["qwen3vl_reason"] = "disabled_by_adaptive_only_mode"
+                    else:
+                        mm_topk = max(1, int(args.agent3_qwen3vl_topk))
+                        qwen3vl_ids = [qwen_filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:mm_topk]]
+                        top_ids = _merge_unique_ids(top_ids, qwen3vl_ids)
+                        used_k = len(top_ids)
+                        kw_debug["qwen3vl_enabled"] = True
+                        kw_debug["qwen3vl_topk"] = mm_topk
+                        kw_debug["qwen3vl_pool_size"] = len(qwen3vl_ids)
+                        kw_debug["qwen3vl_embedded_pool_size"] = len(qwen_filtered_item_ids)
+                        kw_debug["merged_pool_size"] = len(top_ids)
         else:
             kw_debug["qwen3vl_enabled"] = False
-        if bool(getattr(args, "enable_agent3_adaptive_weighting", False)):
+        if adaptive_enabled:
             adaptive_ids, adaptive_state = _adaptive_embedding_fusion(
                 history_ids=history_ids,
                 filtered_item_ids=all_item_ids,
