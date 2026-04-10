@@ -1023,6 +1023,47 @@ def _safe_item_id(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _safe_item_score(value: Any, default_score: float) -> float:
+    if not isinstance(value, dict):
+        return float(default_score)
+    for key in ("ranking_score", "llm_weighted_score", "score"):
+        raw = value.get(key)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return float(default_score)
+
+
+def _roc_auc_binary(y_true_flat: List[int], y_score_flat: List[float]) -> float:
+    n = len(y_true_flat)
+    if n == 0 or len(y_score_flat) != n:
+        return 0.0
+    pairs = sorted([(float(s), int(y)) for s, y in zip(y_score_flat, y_true_flat)], key=lambda x: x[0])
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and pairs[j + 1][0] == pairs[i][0]:
+            j += 1
+        avg_rank = (i + 1 + j + 1) / 2.0
+        for t in range(i, j + 1):
+            ranks[t] = avg_rank
+        i = j + 1
+    pos = 0
+    neg = 0
+    rank_sum_pos = 0.0
+    for r, (_, y) in zip(ranks, pairs):
+        if y == 1:
+            pos += 1
+            rank_sum_pos += r
+        else:
+            neg += 1
+    if pos == 0 or neg == 0:
+        return 0.0
+    return float((rank_sum_pos - pos * (pos + 1) / 2.0) / (pos * neg))
+
+
 def _calc_metrics_from_dynamic_output(path: Path, top_n: int) -> Dict[str, float] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1043,11 +1084,18 @@ def _calc_metrics_from_dynamic_output(path: Path, top_n: int) -> Dict[str, float
     labels = [1 if iid and iid == target_id else 0 for iid in top_ranked_ids]
     if not labels:
         labels = [0]
+    auc_labels = [1 if _safe_item_id(x) == target_id else 0 for x in ranked_items]
+    auc_scores = [
+        _safe_item_score(x, default_score=float(-rank_idx))
+        for rank_idx, x in enumerate(ranked_items, start=1)
+    ]
+    auc = _roc_auc_binary(auc_labels, auc_scores)
 
     return {
         f"recall@{top_n}": _recall_at_k(labels, top_n),
         f"ndcg@{top_n}": _ndcg_at_k(labels, top_n),
         f"mrr@{top_n}": _mrr_at_k(labels, top_n),
+        "auc": float(auc),
     }
 
 
@@ -1093,11 +1141,13 @@ def _print_dynamic_output_metrics(output_dir: str | Path, top_ns: List[int] | Tu
         recall_key = f"recall@{top_k}"
         ndcg_key = f"ndcg@{top_k}"
         mrr_key = f"mrr@{top_k}"
+        auc_key = "auc"
         recall = float(np.mean([x[recall_key] for x in metric_rows]))
         ndcg = float(np.mean([x[ndcg_key] for x in metric_rows]))
         mrr = float(np.mean([x[mrr_key] for x in metric_rows]))
+        auc = float(np.mean([x[auc_key] for x in metric_rows]))
         metric_chunks.append(
-            f"@{top_k} HitRate/Recall={recall:.6f} NDCG={ndcg:.6f} MRR={mrr:.6f}"
+            f"@{top_k} AUC={auc:.6f} HitRate/Recall={recall:.6f} NDCG={ndcg:.6f} MRR={mrr:.6f}"
         )
 
     print(f"[Metrics][Aggregated] files={files_count} " + " | ".join(metric_chunks))
