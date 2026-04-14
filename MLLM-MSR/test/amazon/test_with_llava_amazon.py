@@ -280,7 +280,12 @@ def run(args: argparse.Namespace) -> None:
 
             for cand in group.candidates:
                 image = load_or_download_image(cand.image_url, timeout=args.image_timeout)
-                inputs = processor(cand.prompt, image, return_tensors="pt", padding=True).to(device)
+                inputs = processor(
+                    text=cand.prompt,
+                    images=image,
+                    return_tensors="pt",
+                    padding=True,
+                ).to(device)
 
                 with torch.no_grad():
                     outputs = model.generate(
