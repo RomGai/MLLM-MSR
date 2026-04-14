@@ -42,9 +42,11 @@ def read_item_desc(path: Path) -> Dict[str, Dict[str, str]]:
         reader = csv.DictReader(f, delimiter="\t")
         for row in reader:
             item_id = str(row["item_id"]).strip()
+            image_raw = row.get("image")
+            summary_raw = row.get("summary")
             items[item_id] = {
-                "image": row.get("image", "").strip(),
-                "summary": row.get("summary", "").strip(),
+                "image": (image_raw or "").strip(),
+                "summary": (summary_raw or "").strip(),
             }
     return items
 
@@ -101,6 +103,7 @@ def build_eval_groups(
     item_desc_path: Path,
     max_hist: int,
     max_chars_per_item: int,
+    skip_missing_image: bool,
 ) -> List[EvalUserGroup]:
     item_desc = read_item_desc(item_desc_path)
     user_history = read_user_history(user_pairs_path)
@@ -127,6 +130,8 @@ def build_eval_groups(
             candidates: List[EvalCandidate] = []
             for item_id in pos_items:
                 meta = item_desc.get(item_id, {})
+                if skip_missing_image and not meta.get("image", ""):
+                    continue
                 candidates.append(
                     EvalCandidate(
                         item_id=item_id,
@@ -137,6 +142,8 @@ def build_eval_groups(
                 )
             for item_id in neg_items:
                 meta = item_desc.get(item_id, {})
+                if skip_missing_image and not meta.get("image", ""):
+                    continue
                 candidates.append(
                     EvalCandidate(
                         item_id=item_id,
@@ -240,6 +247,7 @@ def run(args: argparse.Namespace) -> None:
         item_desc_path=Path(args.item_desc_path),
         max_hist=args.max_hist,
         max_chars_per_item=args.max_chars_per_item,
+        skip_missing_image=args.skip_missing_image,
     )
 
     if args.max_users > 0:
@@ -344,6 +352,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-chars-per-item", type=int, default=180)
     p.add_argument("--max-users", type=int, default=0, help="0 means use all users")
     p.add_argument("--image-timeout", type=int, default=15)
+    p.add_argument(
+        "--skip-missing-image",
+        action="store_true",
+        default=True,
+        help="Skip candidates whose image URL is missing. Enabled by default.",
+    )
+    p.add_argument(
+        "--keep-missing-image",
+        action="store_false",
+        dest="skip_missing_image",
+        help="Keep candidates with missing image URL and use blank fallback image.",
+    )
     return p
 
 
