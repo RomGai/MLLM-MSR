@@ -5,7 +5,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 import numpy as np
 import requests
@@ -30,10 +30,6 @@ class EvalUserGroup:
     user_id: str
     group_id: int
     candidates: List[EvalCandidate]
-
-
-def parse_comma_ids(raw: str) -> List[str]:
-    return [x.strip() for x in raw.split(",") if x.strip()]
 
 
 def read_item_desc(path: Path) -> Dict[str, Dict[str, str]]:
@@ -65,16 +61,15 @@ def read_user_history(path: Path) -> Dict[str, List[Tuple[int, str]]]:
     return hist
 
 
-def build_history_text(
-    user_id: str,
-    user_history: Dict[str, List[Tuple[int, str]]],
+def build_history_text_from_item_ids(
+    history_item_ids: List[str],
     item_desc: Dict[str, Dict[str, str]],
     max_hist: int,
     max_chars_per_item: int,
 ) -> str:
-    rows = user_history.get(user_id, [])[-max_hist:]
+    rows = history_item_ids[-max_hist:]
     parts: List[str] = []
-    for _, item_id in rows:
+    for item_id in rows:
         desc = item_desc.get(item_id, {}).get("summary", "")
         if not desc:
             continue
@@ -104,46 +99,70 @@ def build_eval_groups(
     max_hist: int,
     max_chars_per_item: int,
     skip_missing_image: bool,
+    num_negatives: int,
+    seed: int,
 ) -> List[EvalUserGroup]:
     item_desc = read_item_desc(item_desc_path)
     user_history = read_user_history(user_pairs_path)
+    rng = np.random.default_rng(seed)
+
+    if skip_missing_image:
+        all_item_ids = [iid for iid, meta in item_desc.items() if meta.get("image", "")]
+    else:
+        all_item_ids = list(item_desc.keys())
+    all_item_id_set = set(all_item_ids)
 
     groups: List[EvalUserGroup] = []
     with test_negs_path.open("r", encoding="utf-8") as f:
         reader = csv.reader(f, delimiter="\t")
         group_id = 0
         for row in reader:
-            if len(row) < 3:
+            if len(row) < 1:
                 continue
             user_id = str(row[0]).strip()
-            pos_items = parse_comma_ids(row[1])
-            neg_items = parse_comma_ids(row[2])
+            user_hist_rows = user_history.get(user_id, [])
+            if len(user_hist_rows) < 2:
+                continue
 
-            history_text = build_history_text(
-                user_id=user_id,
-                user_history=user_history,
+            pos_index = None
+            for i in range(len(user_hist_rows) - 1, -1, -1):
+                cand_item = user_hist_rows[i][1]
+                if cand_item in all_item_id_set:
+                    pos_index = i
+                    break
+            if pos_index is None or pos_index == 0:
+                continue
+
+            pos_item = user_hist_rows[pos_index][1]
+            history_for_prompt = [iid for _, iid in user_hist_rows[:pos_index]]
+
+            user_hist_items: Set[str] = {item for _, item in user_history.get(user_id, [])}
+            neg_pool = list(all_item_id_set - user_hist_items - {pos_item})
+            if not neg_pool:
+                continue
+            sample_size = min(num_negatives, len(neg_pool))
+            sampled_neg_items = rng.choice(neg_pool, size=sample_size, replace=False).tolist()
+
+            history_text = build_history_text_from_item_ids(
+                history_item_ids=history_for_prompt,
                 item_desc=item_desc,
                 max_hist=max_hist,
                 max_chars_per_item=max_chars_per_item,
             )
 
             candidates: List[EvalCandidate] = []
-            for item_id in pos_items:
-                meta = item_desc.get(item_id, {})
-                if skip_missing_image and not meta.get("image", ""):
-                    continue
-                candidates.append(
-                    EvalCandidate(
-                        item_id=item_id,
-                        label=1,
-                        prompt=build_prompt(history_text, meta.get("summary", "")),
-                        image_url=meta.get("image", ""),
-                    )
+            pos_meta = item_desc.get(pos_item, {})
+            candidates.append(
+                EvalCandidate(
+                    item_id=pos_item,
+                    label=1,
+                    prompt=build_prompt(history_text, pos_meta.get("summary", "")),
+                    image_url=pos_meta.get("image", ""),
                 )
-            for item_id in neg_items:
+            )
+
+            for item_id in sampled_neg_items:
                 meta = item_desc.get(item_id, {})
-                if skip_missing_image and not meta.get("image", ""):
-                    continue
                 candidates.append(
                     EvalCandidate(
                         item_id=item_id,
@@ -169,11 +188,10 @@ def load_or_download_image(url: str, timeout: int = 15) -> Image.Image:
         return Image.new("RGB", (336, 336), color=(0, 0, 0))
 
 
-def recall_at_k(labels: List[int], probs: List[float], k: int) -> float:
+def hr_at_k(labels: List[int], probs: List[float], k: int) -> float:
     pairs = sorted(zip(probs, labels), key=lambda x: x[0], reverse=True)
     topk_labels = [lab for _, lab in pairs[:k]]
-    total_positives = max(sum(labels), 1)
-    return float(sum(topk_labels) / total_positives)
+    return 1.0 if any(topk_labels) else 0.0
 
 
 def mrr_at_k(labels: List[int], probs: List[float], k: int) -> float:
@@ -248,6 +266,8 @@ def run(args: argparse.Namespace) -> None:
         max_hist=args.max_hist,
         max_chars_per_item=args.max_chars_per_item,
         skip_missing_image=args.skip_missing_image,
+        num_negatives=args.num_negatives,
+        seed=args.seed,
     )
 
     if args.max_users > 0:
@@ -256,8 +276,11 @@ def run(args: argparse.Namespace) -> None:
     if not groups:
         raise ValueError("No user groups loaded. Please check input files.")
 
+    configured_ks = [int(x.strip()) for x in args.top_ks.split(",") if x.strip()]
     min_candidate_num = min(len(g.candidates) for g in groups if g.candidates)
-    ks = [k for k in (3, 5, 10) if k <= min_candidate_num]
+    ks = [k for k in configured_ks if k <= min_candidate_num]
+    if not ks:
+        raise ValueError(f"No valid K in --top-ks for candidate size {min_candidate_num}.")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -322,7 +345,7 @@ def run(args: argparse.Namespace) -> None:
 
             user_metric_row: Dict[str, float] = {}
             for k in ks:
-                user_metric_row[f"HR@{k}"] = recall_at_k(user_labels, user_probs, k)
+                user_metric_row[f"HR@{k}"] = hr_at_k(user_labels, user_probs, k)
                 user_metric_row[f"MRR@{k}"] = mrr_at_k(user_labels, user_probs, k)
                 user_metric_row[f"NDCG@{k}"] = ndcg_at_k(user_labels, user_probs, k)
             per_user_rows.append(user_metric_row)
@@ -357,6 +380,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-chars-per-item", type=int, default=180)
     p.add_argument("--max-users", type=int, default=0, help="0 means use all users")
     p.add_argument("--image-timeout", type=int, default=15)
+    p.add_argument("--num-negatives", type=int, default=1000)
+    p.add_argument("--top-ks", default="20,40", help="Comma separated list, e.g. 20,40")
+    p.add_argument("--seed", type=int, default=20260414)
     p.add_argument(
         "--skip-missing-image",
         action="store_true",

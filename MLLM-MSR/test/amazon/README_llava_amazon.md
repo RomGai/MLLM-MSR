@@ -11,6 +11,7 @@
   - 每处理完一个用户，都会打印一次**当前已处理用户的平均指标**（不是仅当前用户）
 - **指标**：AUC、HR@K、MRR@K、NDCG@K
 - **缺失图片处理**：默认会跳过 `image` 为空的候选；如需保留可加 `--keep-missing-image`
+- **采样策略**：每个用户的正样本使用其历史序列中“最后一次交互 item”，其之前的历史用于偏好提示；负样本为随机采样 `1000` 个（可通过参数修改）
 
 ## 一条可直接运行的命令
 
@@ -19,7 +20,9 @@ python MLLM-MSR/test/amazon/test_with_llava_amazon.py \
   --item-desc-path MLLM-MSR/data/amazon/processed/Baby_Products_item_desc.tsv \
   --user-pairs-path MLLM-MSR/data/amazon/processed/Baby_Products_u_i_pairs.tsv \
   --test-negs-path MLLM-MSR/data/amazon/processed/Baby_Products_user_items_negs_test.csv \
-  --output-dir MLLM-MSR/test/amazon/outputs_baby_llava
+  --output-dir MLLM-MSR/test/amazon/outputs_baby_llava \
+  --num-negatives 1000 \
+  --top-ks 20,40
 ```
 
 ## 数据构造方式
