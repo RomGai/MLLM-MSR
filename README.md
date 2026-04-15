@@ -59,3 +59,39 @@ If you use the code of this repo, please cite our paper as,
   pages={13069--13077},
   year={2025}
 }
+
+## MLLMRec-R1 Adapted Workflow (Amazon processed format)
+
+1. **Data adaptation**: use files containing `_train` and `_test` in filename to split users and build a HuggingFace train/validation dataset.
+2. **SFT training**: load the backbone model directly from HuggingFace and train LoRA adapters.
+3. **Final ranking inference**: for each test user, rank **1 target + 1000 random sampled negatives**, report target rank and running average HR/NDCG after each user.
+
+### Run commands (training + final inference)
+
+```bash
+# 1) Build training dataset from processed data
+python MLLM-MSR/train/microlens/build_mllmrec_r1_dataset.py \
+  --processed-dir MLLM-MSR/data/amazon/processed \
+  --domain Baby_Products \
+  --output MLLM-MSR/train/microlens/amazon_mllmrec_r1_dataset
+
+# 2) Train (backbone loaded from HuggingFace, LoRA saved locally)
+python MLLM-MSR/train/microlens/train_llava_sft_adapted.py \
+  --dataset-path MLLM-MSR/train/microlens/amazon_mllmrec_r1_dataset \
+  --model-id llava-hf/llava-v1.6-mistral-7b-hf \
+  --output-dir MLLM-MSR/train/microlens/outputs_llava_lora \
+  --epochs 1 --devices 1
+
+# 3) Final inference with 1 target + 1000 sampled candidates
+python MLLM-MSR/test/microlens/test_with_llava_sft_rank1000.py \
+  --processed-dir MLLM-MSR/data/amazon/processed \
+  --domain Baby_Products \
+  --model-id llava-hf/llava-v1.6-mistral-7b-hf \
+  --peft-model-id MLLM-MSR/train/microlens/outputs_llava_lora/epoch_1
+```
+
+Or run everything with one command:
+
+```bash
+bash run_mllmrec_r1_pipeline.sh --domain Baby_Products
+```
